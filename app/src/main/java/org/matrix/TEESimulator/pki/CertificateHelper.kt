@@ -6,10 +6,13 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.StringReader
 import java.security.KeyPair
+import java.security.PublicKey
+import java.security.Signature
 import java.security.cert.Certificate
 import java.security.cert.CertificateException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
 import org.bouncycastle.openssl.PEMKeyPair
 import org.bouncycastle.openssl.PEMParser
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter
@@ -109,23 +112,60 @@ object CertificateHelper {
      * @return An [OperationResult.Success] with the [KeyPair], or an [OperationResult.Error] on
      *   failure.
      */
-    fun parsePemKeyPair(pemContent: String): OperationResult<KeyPair> {
+    fun parsePemKeyPair(
+        pemContent: String,
+        certificatePublicKey: PublicKey? = null,
+    ): OperationResult<KeyPair> {
         return try {
             PEMParser(StringReader(pemContent.trimLines())).use { parser ->
                 when (val pemObject = parser.readObject()) {
                     is PEMKeyPair -> {
-                        val keyPair = JcaPEMKeyConverter().getKeyPair(pemObject)
-                        OperationResult.Success(keyPair)
+                        // Preserve traditional BEGIN EC/RSA PRIVATE KEY compatibility.
+                        OperationResult.Success(JcaPEMKeyConverter().getKeyPair(pemObject))
                     }
-                    else ->
-                        OperationResult.Error(
-                            "Invalid PEM format: Expected a key pair, but got ${pemObject?.javaClass?.simpleName}"
-                        )
+                    is PrivateKeyInfo -> {
+                        // BEGIN PRIVATE KEY: unencrypted PKCS#8 has no public key field.
+                        // Obtain the corresponding public key from the first certificate.
+                        if (certificatePublicKey == null) {
+                            OperationResult.Error(
+                                "PKCS#8 private key requires the matching leaf certificate public key"
+                            )
+                        } else {
+                            val privateKey = JcaPEMKeyConverter().getPrivateKey(pemObject)
+                            val signatureAlgorithm =
+                                when (privateKey.algorithm.uppercase(java.util.Locale.ROOT)) {
+                                    "RSA" -> "SHA256withRSA"
+                                    "EC", "ECDSA" -> "SHA256withECDSA"
+                                    else -> throw IllegalArgumentException(
+                                        "Unsupported PKCS#8 algorithm: ${privateKey.algorithm}"
+                                    )
+                                }
+                            // Verify that certificate and private key belong together before
+                            // the key is cached. No secret or signature is written to disk.
+                            val probe = "TEESimulator-RS PKCS8 keypair validation".toByteArray()
+                            val signer = Signature.getInstance(signatureAlgorithm).apply {
+                                initSign(privateKey)
+                                update(probe)
+                            }
+                            val signature = signer.sign()
+                            val verifier = Signature.getInstance(signatureAlgorithm).apply {
+                                initVerify(certificatePublicKey)
+                                update(probe)
+                            }
+                            require(verifier.verify(signature)) {
+                                "PKCS#8 private key does not match certificate public key"
+                            }
+                            OperationResult.Success(KeyPair(certificatePublicKey, privateKey))
+                        }
+                    }
+                    else -> OperationResult.Error(
+                        "Unsupported PEM object: ${pemObject?.javaClass?.simpleName ?: "null"}"
+                    )
                 }
             }
         } catch (e: Exception) {
             SystemLogger.error("Failed to parse PEM key pair.", e)
-            OperationResult.Error("Failed to parse PEM key pair", e)
+            OperationResult.Error("Failed to parse PEM key pair: ${e.message}", e)
         }
     }
 

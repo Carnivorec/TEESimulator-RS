@@ -770,7 +770,12 @@ class KeyMintSecurityLevelInterceptor(
                 // keybox) would otherwise leave no per-UID record. Pair this with the preceding
                 // `dispatch` line to see which request failed and why.
                 SystemLogger.uidLog(callingUid, txId, "forge-fail") { "ex=${ex.message}" }
-                InterceptorUtils.createServiceSpecificErrorReply(SECURE_HW_COMMUNICATION_FAILED)
+                // Preserve service-specific KeyMint failures instead of hiding them as -49.
+                if (ex is android.os.ServiceSpecificException) {
+                    InterceptorUtils.createServiceSpecificErrorReply(ex.errorCode)
+                } else {
+                    InterceptorUtils.createServiceSpecificErrorReply(SECURE_HW_COMMUNICATION_FAILED)
+                }
             }
     }
 

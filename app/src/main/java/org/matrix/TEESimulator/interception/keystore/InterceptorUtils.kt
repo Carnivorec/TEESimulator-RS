@@ -37,8 +37,9 @@ object InterceptorUtils {
             -6 -> "Error::Km(INCOMPATIBLE_PURPOSE)"
             -7 -> "Error::Km(INCOMPATIBLE_ALGORITHM)"
             -29 -> "Error::Km(TOO_MANY_OPERATIONS)"
-            -49 -> "Error::Km(UNSUPPORTED_TAG)"
-            -75 -> "Error::Km(INVALID_INPUT_LENGTH)"
+            -49 -> "Error::Km(SECURE_HW_COMMUNICATION_FAILED)"
+            -74 -> "Error::Km(ATTESTATION_KEYS_NOT_PROVISIONED)"
+            -75 -> "Error::Km(ATTESTATION_IDS_NOT_PROVISIONED)"
             -76 -> "Error::Km(INVALID_TAG)"
             else -> if (errorCode > 0) "Error::Rc($errorCode)" else "Error::Km($errorCode)"
         }
