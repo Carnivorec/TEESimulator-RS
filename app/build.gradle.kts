@@ -38,6 +38,10 @@ val gitCommitCount =
     gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt() + versionCodeFloorOffset
 val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
 val verName = "v6.0.1"
+// When building this fork, point packaged update metadata to releases from this repo.
+val releaseRepo =
+    System.getenv("GITHUB_REPOSITORY")?.takeIf { it.isNotBlank() }
+        ?: "umud66/TEESimulator-RS"
 
 android {
     namespace = "org.matrix.TEESimulator"
@@ -132,6 +136,7 @@ val refreshUpdateJson by
 
         inputs.property("verName", capturedVerName)
         inputs.property("gitCommitCount", capturedCount)
+        inputs.property("releaseRepo", releaseRepo)
         outputs.file(updateJsonFile)
 
         doLast {
@@ -140,8 +145,8 @@ val refreshUpdateJson by
                 """{
   "version": "$fullVer",
   "versionCode": $capturedCount,
-  "zipUrl": "https://github.com/Enginex0/TEESimulator-RS/releases/download/$fullVer/TEESimulator-RS-$fullVer-Release.zip",
-  "changelog": "https://raw.githubusercontent.com/Enginex0/TEESimulator-RS/main/module/changelog.md"
+  "zipUrl": "https://github.com/$releaseRepo/releases/download/$fullVer/TEESimulator-RS-$fullVer-Release.zip",
+  "changelog": "https://raw.githubusercontent.com/$releaseRepo/main/module/changelog.md"
 }
 """
             )

@@ -28,7 +28,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-          cache: 'gradle'
+          cache: gradle
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,45 +54,68 @@ jobs:
         with:
           key: ccache-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ github.ref_name }}
-            ccache-${{ runner.os }}-
+            ccache-${{ runner.os }}-${{ github.ref_name }}-
             ccache-
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build with Gradle
+      - name: Build module ZIPs
         run: |
           chmod +x ./gradlew
           ./gradlew zipRelease zipDebug -Porg.gradle.parallel=true -Porg.gradle.vfs.watch=true -Dorg.gradle.jvmargs=-Xmx2048m
 
-      - name: Read version
-        id: ver
+      - name: Validate flashable module ZIPs
+        shell: bash
         run: |
-          ver=$(grep 'val verName' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
-          count=$(git rev-list HEAD --count)
-          echo "version=${ver}-${count}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          for variant in Release Debug; do
+            shopt -s nullglob
+            matches=(out/TEESimulator-RS-*-"$variant".zip)
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one $variant ZIP, found ${#matches[@]}"
+              exit 1
+            fi
+            archive="${matches[0]}"
+            unzip -tq "$archive" >/dev/null
+            entries="$(unzip -Z1 "$archive")"
+            for required in module.prop customize.sh service.sh daemon sepolicy.rule; do
+              if ! grep -Fxq "$required" <<< "$entries"; then
+                echo "::error::$archive missing $required at its root"
+                exit 1
+              fi
+            done
+            if ! grep -Eq '^(classes.dex|service.apk)$' <<< "$entries"; then
+              echo "::error::$archive contains no key interception code"
+              exit 1
+            fi
+            version="$(unzip -p "$archive" module.prop | sed -n 's/^version=//p' | tr -d '\r')"
+            id="$(unzip -p "$archive" module.prop | sed -n 's/^id=//p' | tr -d '\r')"
+            [ "$id" = "tricky_store" ]
+            [ "$(basename "$archive")" = "TEESimulator-RS-$version-$variant.zip" ]
+            echo "Validated $archive: id=$id version=$version"
+          done
 
-      - name: List build artifacts
-        run: |
-          echo "Release: $(ls out/*Release*.zip | head -1) ($(du -h out/*Release*.zip | head -1 | cut -f1))"
-          echo "Debug: $(ls out/*Debug*.zip | head -1) ($(du -h out/*Debug*.zip | head -1 | cut -f1))"
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload release build artifact
+        uses: actions/upload-artifact@v4
         with:
           name: TEESimulator-RS-release-zip
           path: out/TEESimulator-RS-*-Release.zip
+          if-no-files-found: error
           retention-days: 30
           compression-level: 0
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload debug build artifact
+        uses: actions/upload-artifact@v4
         with:
           name: TEESimulator-RS-debug-zip
           path: out/TEESimulator-RS-*-Debug.zip
+          if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload R8 mappings
+        uses: actions/upload-artifact@v4
         with:
           name: release-mappings
           path: app/build/outputs/mapping/release
@@ -101,7 +124,7 @@ jobs:
 
   release:
     needs: build
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -110,60 +133,100 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read version
-        id: ver
-        run: |
-          ver=$(grep 'val verName' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
-          count=$(git rev-list HEAD --count)
-          echo "version=${ver}-${count}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@v4
+      # download-artifact unwraps GitHub's outer artifact archive, leaving the
+      # actual flashable ZIP. We upload that ZIP directly to GitHub Releases.
+      - name: Download flashable Release ZIP
+        uses: actions/download-artifact@v4
         with:
           name: TEESimulator-RS-release-zip
           path: zips
 
-      - uses: actions/download-artifact@v4
+      - name: Download flashable Debug ZIP
+        uses: actions/download-artifact@v4
         with:
           name: TEESimulator-RS-debug-zip
           path: zips
 
-      - name: Extract changelog
+      - name: Validate release payload and derive version from module.prop
+        id: ver
+        shell: bash
         run: |
-          ver="${VER#v}"
-          awk "/^## TEESimulator-RS v${ver%%-*}/{flag=1; next} /^## TEESimulator-RS v/{if(flag) exit} flag" module/changelog.md > /tmp/notes.md
-          cat /tmp/notes.md
-        env:
-          VER: ${{ steps.ver.outputs.version }}
+          set -euo pipefail
+          shopt -s nullglob
+          release_matches=(zips/TEESimulator-RS-*-Release.zip)
+          debug_matches=(zips/TEESimulator-RS-*-Debug.zip)
+          [ "${#release_matches[@]}" -eq 1 ] && [ "${#debug_matches[@]}" -eq 1 ]
+          release_zip="${release_matches[0]}"
+          debug_zip="${debug_matches[0]}"
+          unzip -tq "$release_zip" >/dev/null
+          unzip -tq "$debug_zip" >/dev/null
+          version="$(unzip -p "$release_zip" module.prop | sed -n 's/^version=//p' | tr -d '\r')"
+          code="$(unzip -p "$release_zip" module.prop | sed -n 's/^versionCode=//p' | tr -d '\r')"
+          [ -n "$version" ] && [[ "$code" =~ ^[0-9]+$ ]]
+          [ "$(basename "$release_zip")" = "TEESimulator-RS-$version-Release.zip" ]
+          [ "$(basename "$debug_zip")" = "TEESimulator-RS-$version-Debug.zip" ]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_code=$code" >> "$GITHUB_OUTPUT"
+          echo "release_zip=$release_zip" >> "$GITHUB_OUTPUT"
+          echo "debug_zip=$debug_zip" >> "$GITHUB_OUTPUT"
+          echo "Verified flashable ZIPs: $version (versionCode=$code)"
 
-      - name: Create release
+      - name: Prepare release notes
+        shell: bash
         run: |
-          gh release delete "$VER" --yes 2>/dev/null || true
-          RELEASE=$(ls zips/*Release*.zip | head -1)
-          DEBUG=$(ls zips/*Debug*.zip | head -1)
-          gh release create "$VER" \
-            --title "$VER" \
-            --latest \
-            --notes-file /tmp/notes.md \
-            "$RELEASE" \
-            "$DEBUG"
-        env:
-          VER: ${{ steps.ver.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cat > release-notes.md <<'EOF'
+          ## TEESimulator-RS — PKCS#8 Keybox Compatibility
+          
+          - Native support for unencrypted PKCS#8 EC/RSA PEM private keys (BEGIN PRIVATE KEY).
+          - Validates each PKCS#8 private key against the leaf certificate public key.
+          - Empty Keybox parse results no longer remain cached indefinitely.
+          - Preserves underlying KeyMint service-specific error codes for diagnosis.
+          
+          **Installation:** Download the `*-Release.zip` attachment on this Release page directly and install it through your root module manager. Do not flash the outer GitHub Actions Artifact ZIP.
+          
+          **Note:** Built successfully in CI; device compatibility and key attestations depend on the installed Keybox and Android environment. Existing persistent keystore keys are not removed by this change.
+          EOF
 
-      - name: Bump update.json
+      - name: Publish raw module ZIPs to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          RELEASE_ZIP: ${{ steps.ver.outputs.release_zip }}
+          DEBUG_ZIP: ${{ steps.ver.outputs.debug_zip }}
         run: |
-          COUNT=$(git rev-list HEAD --count)
-          RELEASE_NAME=$(basename zips/*Release*.zip)
-          ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${VER}/${RELEASE_NAME}"
-          jq ".versionCode = $COUNT | .zipUrl = \"$ZIP_URL\"" module/update.json > /tmp/update.json
-          mv /tmp/update.json module/update.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "$RELEASE_ZIP" "$DEBUG_ZIP" --clobber
+            gh release edit "$VERSION" --latest
+          else
+            gh release create "$VERSION" "$RELEASE_ZIP" "$DEBUG_ZIP" \
+              --target "$GITHUB_SHA" \
+              --title "TEESimulator-RS $VERSION (PKCS#8 Fix)" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+
+      - name: Update fork OTA metadata
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION_CODE: ${{ steps.ver.outputs.version_code }}
+          RELEASE_ZIP: ${{ steps.ver.outputs.release_zip }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          zip_name="$(basename "$RELEASE_ZIP")"
+          release_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION/$zip_name"
+          changelog_url="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/module/changelog.md"
+          jq -n --arg version "$VERSION" --argjson code "$VERSION_CODE" \
+            --arg zip "$release_url" --arg changelog "$changelog_url" \
+            '{version:$version, versionCode:$code, zipUrl:$zip, changelog:$changelog}' \
+            > module/update.json
           git add module/update.json
-          git diff --cached --quiet || {
-            git commit -m "chore(release): bump update.json to $VER [skip ci]"
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m "chore: point OTA metadata to $VERSION release [skip ci]"
             git push origin HEAD:main
-          }
-        env:
-          VER: ${{ steps.ver.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fi
