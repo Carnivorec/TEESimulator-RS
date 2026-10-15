@@ -187,7 +187,7 @@ object CertificateGenerator {
         // Prefer the algorithm-matching keybox, but fall back to any usable key (EC preferred) when
         // none exists. An EC attestation key validly ECDSA-signs a leaf carrying an RSA subject key,
         // so an EC-only keybox can still root an RSA forge. Without this fallback an RSA ATTEST_KEY
-        // request on an EC-only keybox throws -75 and the caller's chain never roots ("unknown
+        // request on an EC-only keybox throws -74 and the caller's chain never roots ("unknown
         // certificate"). Mirrors the patch path's fail-safe
         // (AttestationPatcher.getKeyboxForUidAndAlgorithm) and the RSA-leaf-under-EC-keybox handling
         // in commit e6d5e4d.
@@ -196,7 +196,7 @@ object CertificateGenerator {
             matched
                 ?: KeyBoxManager.getAnyAttestationKey(keyboxFile)
                 ?: throw android.os.ServiceSpecificException(
-                    -75, // ATTESTATION_KEYS_NOT_PROVISIONED
+                    -74, // ATTESTATION_KEYS_NOT_PROVISIONED (KeyMint AIDL)
                     "No usable attestation key in $keyboxFile",
                 )
         // Surface which keybox actually signs the forge, so an EC-only-keybox fallback (an RSA leaf

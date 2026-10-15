@@ -52,8 +52,7 @@ object KeyBoxManager {
     fun getAttestationKey(keyStoreFileName: String, algorithm: String): KeyBox? {
         // Atomically get the parsed key map for the file from the cache.
         // If it's not in the cache, the `getOrPut` block is executed to parse and store it.
-        val keyMap =
-            keyStoreCache.getOrPut(keyStoreFileName) { parseKeyStoreFile(keyStoreFileName) }
+        val keyMap = loadKeyMap(keyStoreFileName)
         val keyBox = keyMap[algorithm]
         if (keyBox != null) {
             // Surface attestation cert serials on every fetch so a revoked/leaked keybox is
@@ -83,9 +82,20 @@ object KeyBoxManager {
      * @return The preferred [KeyBox], or `null` if the file contains no usable key.
      */
     fun getAnyAttestationKey(keyStoreFileName: String): KeyBox? {
-        val keyMap =
-            keyStoreCache.getOrPut(keyStoreFileName) { parseKeyStoreFile(keyStoreFileName) }
+        val keyMap = loadKeyMap(keyStoreFileName)
         return keyMap[KeyProperties.KEY_ALGORITHM_EC] ?: keyMap.values.firstOrNull()
+    }
+
+    /**
+     * Failed/empty parses must not remain permanently cached. An updater may replace
+     * keybox.xml without FileObserver delivering a usable invalidation event.
+     */
+    private fun loadKeyMap(fileName: String): Map<String, KeyBox> {
+        val parsed = keyStoreCache.getOrPut(fileName) { parseKeyStoreFile(fileName) }
+        if (parsed.isEmpty()) {
+            keyStoreCache.remove(fileName, parsed)
+        }
+        return parsed
     }
 
     /**
@@ -198,16 +208,31 @@ object KeyBoxManager {
                                             keyPem != null &&
                                             currentCertificatePems.isNotEmpty()
                                     ) {
-                                        val keyPair =
-                                            (CertificateHelper.parsePemKeyPair(keyPem)
-                                                    as CertificateHelper.OperationResult.Success)
-                                                .data
+                                        // Parse certificates first: PKCS#8 PrivateKeyInfo
+                                        // does not contain a public key.
                                         val certificates =
-                                            currentCertificatePems.map {
-                                                (CertificateHelper.parsePemCertificate(it)
-                                                        as
-                                                        CertificateHelper.OperationResult.Success)
-                                                    .data
+                                            currentCertificatePems.mapIndexed { index, pem ->
+                                                when (val result =
+                                                    CertificateHelper.parsePemCertificate(pem)) {
+                                                    is CertificateHelper.OperationResult.Success ->
+                                                        result.data
+                                                    is CertificateHelper.OperationResult.Error ->
+                                                        throw IllegalArgumentException(
+                                                            "Certificate #${index + 1}: ${result.message}",
+                                                            result.cause,
+                                                        )
+                                                }
+                                            }
+                                        val keyPair =
+                                            when (val result = CertificateHelper.parsePemKeyPair(
+                                                keyPem, certificates.first().publicKey)) {
+                                                is CertificateHelper.OperationResult.Success ->
+                                                    result.data
+                                                is CertificateHelper.OperationResult.Error ->
+                                                    throw IllegalArgumentException(
+                                                        "Private key: ${result.message}",
+                                                        result.cause,
+                                                    )
                                             }
 
                                         // Derive the TRUE algorithm from the key object itself.
