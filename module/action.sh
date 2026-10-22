@@ -50,10 +50,14 @@ if ! confirm; then
 fi
 
 if [ -d "$CONFIG_DIR/persistent_keys" ]; then
-    rm -rf "$CONFIG_DIR/persistent_keys"
+    # Move instead of delete so a mistaken confirmation stays recoverable.
+    BACKUP="/data/adb/tricky_store_backup/cleared-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP"
+    mv "$CONFIG_DIR/persistent_keys" "$BACKUP/"
     mkdir -p "$CONFIG_DIR/persistent_keys"
     echo " "
     echo "  ✅ $(_msg confirm_cleared)"
+    echo "  ↩️  $BACKUP"
 else
     echo " "
     echo "  ℹ️  $(_msg confirm_not_found)"

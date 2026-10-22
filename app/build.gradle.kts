@@ -41,7 +41,7 @@ val verName = "v6.0.1"
 // When building this fork, point packaged update metadata to releases from this repo.
 val releaseRepo =
     System.getenv("GITHUB_REPOSITORY")?.takeIf { it.isNotBlank() }
-        ?: "umud66/TEESimulator-RS"
+        ?: "Carnivorec/TEESimulator-RS"
 
 android {
     namespace = "org.matrix.TEESimulator"

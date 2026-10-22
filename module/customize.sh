@@ -90,6 +90,26 @@ else
   ui_print "- Release build: swept stale diagnostics"
 fi
 
+# --- Key snapshot ---
+# Upgrades and downgrades must never cost the user their generated keys. Snapshot them, and the
+# boot identity they are attested under, before anything touches the config directory.
+BACKUP_ROOT=/data/adb/tricky_store_backup
+if [ -d "$CONFIG_DIR/persistent_keys" ]; then
+  SNAPSHOT="$BACKUP_ROOT/install-$(date +%Y%m%d-%H%M%S)"
+  if mkdir -p "$SNAPSHOT" && cp -a "$CONFIG_DIR/persistent_keys" "$SNAPSHOT/"; then
+    for f in boot_key.bin boot_hash.bin hbk keybox.xml target.txt security_patch.txt; do
+      [ -f "$CONFIG_DIR/$f" ] && cp -a "$CONFIG_DIR/$f" "$SNAPSHOT/"
+    done
+    ui_print "- Backed up persistent keys to $SNAPSHOT"
+    # Keep the five newest install snapshots.
+    ls -1d "$BACKUP_ROOT"/install-* 2>/dev/null | sort -r | tail -n +6 | while read -r stale; do
+      rm -rf "$stale"
+    done
+  else
+    ui_print "! Failed to back up persistent keys (continuing)"
+  fi
+fi
+
 # --- Configuration Files ---
 if [ ! -d "$CONFIG_DIR" ]; then
   ui_print "- Creating configuration directory"
