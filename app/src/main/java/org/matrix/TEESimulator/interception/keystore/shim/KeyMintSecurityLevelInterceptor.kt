@@ -61,7 +61,6 @@ class KeyMintSecurityLevelInterceptor(
     )
 
     private val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
-    private val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
 
     override fun onPreTransact(
         txId: Long,
@@ -320,22 +319,6 @@ class KeyMintSecurityLevelInterceptor(
         )
     }
 
-    private fun trackAndEnforceOpLimit(callingUid: Int, txId: Long): TransactionResult? {
-        if (securityLevel != SecurityLevel.STRONGBOX) return null
-        val timestamps = recentOps.computeIfAbsent(callingUid) { ConcurrentLinkedDeque() }
-        val cutoff = System.nanoTime() - STRONGBOX_OP_WINDOW_NS
-        timestamps.removeIf { it < cutoff }
-        val swOps = activeOps[callingUid]?.count { !it.finalized } ?: 0
-        if (timestamps.size + swOps >= STRONGBOX_MAX_CONCURRENT_OPS) {
-            SystemLogger.info(
-                "[TX_ID: $txId] StrongBox op limit reached for uid=$callingUid (hw=${timestamps.size} sw=$swOps max=$STRONGBOX_MAX_CONCURRENT_OPS)"
-            )
-            return InterceptorUtils.createErrorReply(KEYMINT_TOO_MANY_OPERATIONS)
-        }
-        timestamps.addLast(System.nanoTime())
-        return null
-    }
-
     private fun handleCreateOperation(
         txId: Long,
         callingUid: Int,
@@ -383,11 +366,10 @@ class KeyMintSecurityLevelInterceptor(
                                     generatedKeys.entries
                                         .filter { it.key.uid == callingUid }
                                         .find { it.value.nspace == nspace }
+                            // Real-HAL operations are left to keystore2 and the HAL, which manage
+                            // their own slots (keystore2 prunes and retries on TOO_MANY_OPERATIONS).
                             entry
                                 ?: run {
-                                    trackAndEnforceOpLimit(callingUid, txId)?.let {
-                                        return it
-                                    }
                                     SystemLogger.info(
                                         "[TX_ID: $txId] createOperation KeyId(${keyDescriptor.nspace}) NOT FOUND for uid=$callingUid. Forwarding to HAL."
                                     )
@@ -404,10 +386,8 @@ class KeyMintSecurityLevelInterceptor(
                 val generatedKeyInfo = resolvedEntry.value
                 val resolvedKeyId = resolvedEntry.key
 
-                trackAndEnforceOpLimit(callingUid, txId)?.let {
-                    return it
-                }
-
+                // Software operations are bounded by pruneOpsForUid below: like keystore2, the
+                // oldest live operation is aborted to make room instead of failing the new one.
                 SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for uid=$callingUid.")
 
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
@@ -1510,13 +1490,11 @@ class KeyMintSecurityLevelInterceptor(
         private const val STRONGBOX_KEYGEN_LATENCY_FLOOR_MS = 250L
         private const val STRONGBOX_OP_LATENCY_FLOOR_MS = 80L
         private const val TEE_OP_LATENCY_FLOOR_MS = 4L
-        private const val KEYMINT_TOO_MANY_OPERATIONS = -29
         private const val KEYMINT_CANNOT_ATTEST_IDS = -66
         private const val KEYMINT_UNKNOWN_ERROR = -1000
         private const val SECURE_HW_COMMUNICATION_FAILED = -49
         private const val MAX_CONCURRENT_OPS_PER_UID = 15
         private const val STRONGBOX_MAX_CONCURRENT_OPS = 4
-        private const val STRONGBOX_OP_WINDOW_NS = 10_000_000_000L // 10s
 
         private fun isStrongBoxCapable(params: KeyMintAttestation): Boolean =
             when (params.algorithm) {
