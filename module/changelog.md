@@ -3,6 +3,26 @@
 
 ---
 
+## TEESimulator-RS v6.0.1-317 (Carnivorec fork)
+
+Based on umud66 v6.0.1-311 (upstream 307 + PKCS#8 keybox support). Focus: never lose the user's keys, and stop breaking apps that rely on fingerprint-bound keys.
+
+### Key safety
+- Uninstalling no longer deletes `persistent_keys`, `boot_key.bin` or `boot_hash.bin`; a reinstall picks them up again.
+- Every install snapshots `persistent_keys` and the boot identity to `/data/adb/tricky_store_backup/install-<time>/` (newest five kept).
+- The action button moves cleared keys to `/data/adb/tricky_store_backup/cleared-<time>/` instead of deleting them.
+- Key files are fsynced before the atomic rename; deletes run on the persist thread so a deleted key can no longer be written back; a key file in another on-disk format is moved to `persistent_keys_foreign/` instead of being overwritten.
+- A forwarded generateKey that the HAL rejects no longer destroys the alias's existing key.
+
+### App compatibility
+- Removed the StrongBox "4 operations per 10 seconds" limiter. It counted operation starts as concurrent operations, never released them, and also hit real-HAL operations of every app, targeted or not (upstream #39, #49, #59).
+- With a working TEE, symmetric keys (AES/HMAC/3DES) go to the real HAL even in generate mode. Existing software symmetric keys keep working.
+- Auth-bound keys no longer report `NO_AUTH_REQUIRED`; they carry `USER_SECURE_ID`, `USER_AUTH_TYPE` and `AUTH_TIMEOUT` as requested.
+
+**Upgrade:** install over the existing module. Do not uninstall first.
+
+---
+
 ## TEESimulator-RS v6.0.1-307
 
 Fixes five gaps in the module's TEE key-operation and attestation emulation. Two of them fix crashes in real app crypto on a broken-TEE device: any app using an AndroidKeyStore HMAC key or an RSA-OAEP-SHA256 key was throwing. This is a beta; the confirmation logs are in the debug build only, and nothing is field-verified yet.
