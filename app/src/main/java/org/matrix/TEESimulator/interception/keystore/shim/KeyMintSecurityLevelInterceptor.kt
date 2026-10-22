@@ -232,6 +232,9 @@ class KeyMintSecurityLevelInterceptor(
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.SkipTransaction
             val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+            // The HAL generated the new key: only now drop what a prior generation cached for
+            // this alias (handleGenerateKey defers it), before any early return below.
+            cleanupKeyData(keyId)
 
             val originalChain = CertificateHelper.getCertificateChain(metadata)
             if (originalChain == null || originalChain.size <= 1) {
