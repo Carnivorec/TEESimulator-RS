@@ -612,21 +612,23 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                     }
                                     .getOrNull()
                             }
-                        GeneratedKeyPersistence.save(
-                            keyId = keyId,
-                            keyPair = keyData.first,
-                            secretKey = null,
-                            nspace = newNspace,
-                            securityLevel = response.metadata.keySecurityLevel,
-                            certChain = keyData.second,
-                            algorithm = parsedParameters.algorithm,
-                            keySize = parsedParameters.keySize,
-                            ecCurve = parsedParameters.ecCurve ?: 0,
-                            purposes = parsedParameters.purpose,
-                            digests = parsedParameters.digest,
-                            isAttestationKey = true,
-                            metadataBytes = metadataBytesForPersist,
-                        )
+                        KeyMintSecurityLevelInterceptor.persist {
+                            GeneratedKeyPersistence.save(
+                                keyId = keyId,
+                                keyPair = keyData.first,
+                                secretKey = null,
+                                nspace = newNspace,
+                                securityLevel = response.metadata.keySecurityLevel,
+                                certChain = keyData.second,
+                                algorithm = parsedParameters.algorithm,
+                                keySize = parsedParameters.keySize,
+                                ecCurve = parsedParameters.ecCurve ?: 0,
+                                purposes = parsedParameters.purpose,
+                                digests = parsedParameters.digest,
+                                isAttestationKey = true,
+                                metadataBytes = metadataBytesForPersist,
+                            )
+                        }
 
                         return InterceptorUtils.createTypedObjectReply(response)
                     }

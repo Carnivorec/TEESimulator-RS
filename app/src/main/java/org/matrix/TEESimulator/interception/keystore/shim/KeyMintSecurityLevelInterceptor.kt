@@ -137,7 +137,7 @@ class KeyMintSecurityLevelInterceptor(
             val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
             if (generatedKeys.remove(keyId) != null) {
                 SystemLogger.debug("Remove generated key on importKey $keyId")
-                GeneratedKeyPersistence.delete(keyId)
+                persist { GeneratedKeyPersistence.delete(keyId) }
             }
             teeResponses.remove(keyId)
             patchedChains.remove(keyId)
@@ -701,9 +701,17 @@ class KeyMintSecurityLevelInterceptor(
                 // Devices that can attest keep their genuine chain via PATCH, which strict callers
                 // accept where a forgery is rejected.
                 val strongBox = securityLevel == SecurityLevel.STRONGBOX
+                // Symmetric keys carry no certificate chain, so there is nothing to attest or
+                // spoof. With a working TEE they go to the real HAL even in generate mode: a
+                // software AES/HMAC key only adds risk (wrong authorizations made
+                // react-native-keychain delete and regenerate its key forever, and any data it
+                // encrypted dies with the module's key store). Only a dead TEE still needs them
+                // forged.
+                val forgeSymmetric = !DeviceAttestationService.isTeeFunctional
                 val forceGenerate =
                     oversized ||
-                        ConfigurationManager.shouldGenerate(callingUid) ||
+                        (ConfigurationManager.shouldGenerate(callingUid) &&
+                            (!isSymmetric || forgeSymmetric)) ||
                         isAttestKeyRequest ||
                         attestationKey != null ||
                         hasDeviceIdAttestation ||
@@ -847,7 +855,7 @@ class KeyMintSecurityLevelInterceptor(
                         }
                     }
                     .getOrNull()
-            persistExecutor.execute {
+            persist {
                 GeneratedKeyPersistence.save(
                     keyId = keyId,
                     keyPair = null,
@@ -972,7 +980,7 @@ class KeyMintSecurityLevelInterceptor(
                     }
                     .getOrNull()
             }
-        persistExecutor.execute {
+        persist {
             GeneratedKeyPersistence.save(
                 keyId = keyId,
                 keyPair = keyData.first,
@@ -1077,7 +1085,7 @@ class KeyMintSecurityLevelInterceptor(
                         usageCountLimit = params.usageCountLimit ?: -1,
                         callerNonce = params.callerNonce == true,
                         unlockedDeviceRequired = params.unlockedDeviceRequired == true,
-                        noAuthRequired = params.noAuthRequired != false,
+                        noAuthRequired = params.noAuthRequired == true,
                         uid = callingUid,
                         debugLogging = SystemLogger.isDebugBuild,
                     )
@@ -1533,6 +1541,13 @@ class KeyMintSecurityLevelInterceptor(
 
         private val persistExecutor = Executors.newSingleThreadExecutor()
 
+        /**
+         * Runs persistence I/O on the single persist thread. Saves and deletes must share it: a
+         * synchronous delete could otherwise overtake a still-queued save and the deleted key would
+         * be written back.
+         */
+        fun persist(task: () -> Unit) = persistExecutor.execute(task)
+
         val generatedKeys = ConcurrentHashMap<KeyIdentifier, GeneratedKeyInfo>()
         val teeResponses = ConcurrentHashMap<KeyIdentifier, KeyEntryResponse>()
         val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
@@ -1663,7 +1678,7 @@ class KeyMintSecurityLevelInterceptor(
             purgeGrantsForKey(keyId) // grants die with the key (Android 16 path; no-op pre-36)
             if (generatedKeys.remove(keyId) != null) {
                 SystemLogger.debug("Remove generated key ${keyId}")
-                GeneratedKeyPersistence.delete(keyId)
+                persist { GeneratedKeyPersistence.delete(keyId) }
             }
             teeResponses.remove(keyId)
             if (patchedChains.remove(keyId) != null) {
@@ -1702,7 +1717,7 @@ class KeyMintSecurityLevelInterceptor(
             softwareGrants.entries
                 .filter { it.value.ownerKeyId == srcId }
                 .forEach { softwareGrants[it.key] = it.value.copy(ownerKeyId = dstId) }
-            GeneratedKeyPersistence.delete(srcId)
+            persist { GeneratedKeyPersistence.delete(srcId) }
             SystemLogger.info(
                 "Migrated synthetic key $srcId -> $dstId (maintenance.migrateKeyNamespace)"
             )
@@ -1734,7 +1749,7 @@ class KeyMintSecurityLevelInterceptor(
             importedKeys.clear()
             usageCounters.clear()
             softwareGrants.clear()
-            GeneratedKeyPersistence.deleteAll()
+            persist { GeneratedKeyPersistence.deleteAll() }
             SystemLogger.info("Cleared all cached keys ($count entries)$reasonMessage.")
         }
     }
@@ -1821,8 +1836,23 @@ private fun KeyMintAttestation.toAuthorizations(
         authList.add(createAuth(Tag.MAX_BOOT_LEVEL, KeyParameterValue.integer(this.maxBootLevel)))
     }
 
-    if (this.noAuthRequired != false) {
+    // The framework always sends NO_AUTH_REQUIRED for keys without user authentication, so its
+    // absence means the key is auth-bound. Treating "absent" as "no auth" made every fingerprint
+    // key report isUserAuthenticationRequired=false, which apps read as a broken key.
+    if (this.noAuthRequired == true) {
         authList.add(createAuth(Tag.NO_AUTH_REQUIRED, KeyParameterValue.boolValue(true)))
+    } else {
+        this.userSecureIds.forEach {
+            authList.add(createAuth(Tag.USER_SECURE_ID, KeyParameterValue.longInteger(it)))
+        }
+        this.userAuthType?.let {
+            authList.add(
+                createAuth(Tag.USER_AUTH_TYPE, KeyParameterValue.hardwareAuthenticatorType(it))
+            )
+        }
+        this.authTimeout?.let {
+            authList.add(createAuth(Tag.AUTH_TIMEOUT, KeyParameterValue.integer(it)))
+        }
     }
     authList.add(
         createAuth(Tag.ORIGIN, KeyParameterValue.origin(this.origin ?: KeyOrigin.GENERATED))

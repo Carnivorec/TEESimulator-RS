@@ -72,6 +72,29 @@ object GeneratedKeyPersistence {
         return fileLocks.computeIfAbsent(filename) { ReentrantLock() }
     }
 
+    /** Key files written by a build with another on-disk format, kept for switching back. */
+    private val FOREIGN_FORMAT_DIR = File(CONFIG_PATH, "persistent_keys_foreign")
+
+    /**
+     * A key file in another format was written by a different module build (this is an upgrade or
+     * a downgrade). Loading skips it, so the app regenerates the alias; move the old file aside
+     * before that new key overwrites it, so the user's original key is never destroyed.
+     */
+    private fun preserveForeignFormat(file: File) {
+        if (!file.exists()) return
+        val version =
+            runCatching { DataInputStream(FileInputStream(file)).use { it.readInt() } }.getOrNull()
+        if (version == FORMAT_VERSION) return
+        val dir = File(FOREIGN_FORMAT_DIR, "v$version")
+        dir.mkdirs()
+        val target = File(dir, file.name)
+        if (file.renameTo(target)) {
+            SystemLogger.warning("Moved format v$version key file ${file.name} to $dir")
+        } else {
+            SystemLogger.error("Failed to move format v$version key file ${file.name} to $dir")
+        }
+    }
+
     fun save(
         keyId: KeyIdentifier,
         keyPair: KeyPair?,
@@ -102,8 +125,8 @@ object GeneratedKeyPersistence {
                     val tmpFile = File(PERSISTENCE_DIR, "$filename.tmp")
 
                     try {
-                        DataOutputStream(BufferedOutputStream(FileOutputStream(tmpFile))).use { out
-                            ->
+                        val fileOut = FileOutputStream(tmpFile)
+                        DataOutputStream(BufferedOutputStream(fileOut)).use { out ->
                             out.writeInt(FORMAT_VERSION)
                             out.writeInt(securityLevel)
                             out.writeInt(keyId.uid)
@@ -148,11 +171,17 @@ object GeneratedKeyPersistence {
                                 out.writeUTF("")
                                 out.writeInt(0)
                             }
+                            // Reach the disk before the rename, so a crash or power loss
+                            // cannot leave a renamed but empty key file.
+                            out.flush()
+                            fileOut.fd.sync()
                         }
                     } catch (e: Exception) {
                         tmpFile.delete()
                         throw e
                     }
+
+                    preserveForeignFormat(finalFile)
 
                     // Atomic rename — if this fails the tmp is left behind and cleaned on next
                     // deleteAll
@@ -249,8 +278,8 @@ object GeneratedKeyPersistence {
                             // new format. Affected apps re-login once after
                             // upgrade, then never again.
                             SystemLogger.info(
-                                "Skipping ${file.name}: legacy format version $version. " +
-                                    "It will be replaced on next generateKey for this alias."
+                                "Skipping ${file.name}: format version $version. It is moved " +
+                                    "to ${FOREIGN_FORMAT_DIR.name} if this alias is regenerated."
                             )
                             return@runCatching
                         }

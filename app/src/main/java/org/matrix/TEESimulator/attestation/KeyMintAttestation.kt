@@ -60,6 +60,10 @@ data class KeyMintAttestation(
     val minMacLength: Int?,
     val macLength: Int? = null,
     val rsaOaepMgfDigest: List<Int>,
+    // User-auth binding. The framework sends either NO_AUTH_REQUIRED or these tags.
+    val userSecureIds: List<Long> = emptyList(),
+    val userAuthType: Int? = null,
+    val authTimeout: Int? = null,
 ) {
     /** Secondary constructor that populates the fields by parsing an array of `KeyParameter`. */
     constructor(
@@ -137,6 +141,10 @@ data class KeyMintAttestation(
         minMacLength = params.findInteger(Tag.MIN_MAC_LENGTH),
         macLength = params.findInteger(Tag.MAC_LENGTH),
         rsaOaepMgfDigest = params.findAllDigests(Tag.RSA_OAEP_MGF_DIGEST),
+        userSecureIds = params.filter { it.tag == Tag.USER_SECURE_ID }.map { it.value.longInteger },
+        userAuthType =
+            params.firstOrNull { it.tag == Tag.USER_AUTH_TYPE }?.value?.hardwareAuthenticatorType,
+        authTimeout = params.findInteger(Tag.AUTH_TIMEOUT),
     ) {
         // Log all parsed parameters for debugging purposes.
         params.forEach { KeyMintParameterLogger.logParameter(it) }
