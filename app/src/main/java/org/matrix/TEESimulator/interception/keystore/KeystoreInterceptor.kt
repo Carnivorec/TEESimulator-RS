@@ -444,7 +444,7 @@ private data class LegacyKeygenParameters(
             allowWhileOnBody = null,
             trustedUserPresenceRequired = null,
             trustedConfirmationRequired = null,
-            noAuthRequired = null,
+            noAuthRequired = true, // auth tags not parsed; keep pre-fix default
             maxUsesPerBoot = null,
             maxBootLevel = null,
             minMacLength = null,

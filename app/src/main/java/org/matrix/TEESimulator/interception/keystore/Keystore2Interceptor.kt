@@ -753,10 +753,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 certificateChain = data.createByteArray(),
                 persist = {
                     if (generatedKeyInfo != null) {
-                        GeneratedKeyPersistence.rePersistIfNeeded(
-                            grant.ownerKeyId.uid,
-                            generatedKeyInfo,
-                        )
+                        // Queue behind any pending save of this key so it cannot overwrite us.
+                        KeyMintSecurityLevelInterceptor.persist {
+                            GeneratedKeyPersistence.rePersistIfNeeded(
+                                grant.ownerKeyId.uid,
+                                generatedKeyInfo,
+                            )
+                        }
                     }
                 },
                 label = "grant[${descriptor.nspace}] -> ${grant.ownerKeyId}",
@@ -811,7 +814,10 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             publicCert = data.createByteArray(),
             certificateChain = data.createByteArray(),
             persist = {
-                GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
+                // Queue behind any pending save of this key so it cannot overwrite us.
+                KeyMintSecurityLevelInterceptor.persist {
+                    GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
+                }
             },
             label = "key[${generatedKeyInfo.nspace}]",
         )
