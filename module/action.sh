@@ -58,6 +58,10 @@ if [ -d "$CONFIG_DIR/persistent_keys" ]; then
     echo " "
     echo "  ✅ $(_msg confirm_cleared)"
     echo "  ↩️  $BACKUP"
+    # The daemon holds the keys in memory until it restarts.
+    REBOOT_MSG="$(_msg confirm_reboot)"
+    [ -z "$REBOOT_MSG" ] && REBOOT_MSG="Reboot to finish: the old keys stay in use until then"
+    echo "  🔄 $REBOOT_MSG"
 else
     echo " "
     echo "  ℹ️  $(_msg confirm_not_found)"

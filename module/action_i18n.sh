@@ -29,6 +29,7 @@ _msg() {
         confirm_vol_down)   echo "音量- = 取消（10秒后默认）" ;;
         confirm_cancelled)  echo "已取消 - 密钥已保留" ;;
         confirm_cleared)    echo "持久化密钥存储已清除" ;;
+        confirm_reboot)     echo "重启后才会生效，在此之前仍在使用旧密钥" ;;
         confirm_not_found)  echo "未找到持久化密钥存储" ;;
     esac ;;
     zh-TW) case "$1" in
@@ -39,6 +40,7 @@ _msg() {
         confirm_vol_down)   echo "音量- = 取消（10秒後預設）" ;;
         confirm_cancelled)  echo "已取消 - 金鑰已保留" ;;
         confirm_cleared)    echo "持久化金鑰儲存已清除" ;;
+        confirm_reboot)     echo "重新啟動後才會生效，在此之前仍使用舊金鑰" ;;
         confirm_not_found)  echo "未找到持久化金鑰儲存" ;;
     esac ;;
     ja) case "$1" in
@@ -249,6 +251,7 @@ _msg() {
         confirm_vol_down)   echo "Vol-  = Cancel (default after 10s)" ;;
         confirm_cancelled)  echo "Cancelled - keys preserved" ;;
         confirm_cleared)    echo "Persistent key storage cleared" ;;
+        confirm_reboot)     echo "Reboot to finish: the old keys stay in use until then" ;;
         confirm_not_found)  echo "No persistent key storage found" ;;
     esac ;;
     esac

@@ -97,6 +97,8 @@ BACKUP_ROOT=/data/adb/tricky_store_backup
 if [ -d "$CONFIG_DIR/persistent_keys" ]; then
   SNAPSHOT="$BACKUP_ROOT/install-$(date +%Y%m%d-%H%M%S)"
   if mkdir -p "$SNAPSHOT" && cp -a "$CONFIG_DIR/persistent_keys" "$SNAPSHOT/"; then
+    # Key files kept aside from another module build's on-disk format are user keys as well.
+    [ -d "$CONFIG_DIR/persistent_keys_foreign" ] && cp -a "$CONFIG_DIR/persistent_keys_foreign" "$SNAPSHOT/"
     for f in boot_key.bin boot_hash.bin hbk keybox.xml target.txt security_patch.txt; do
       [ -f "$CONFIG_DIR/$f" ] && cp -a "$CONFIG_DIR/$f" "$SNAPSHOT/"
     done
