@@ -67,13 +67,28 @@ private sealed interface CryptoPrimitive {
 }
 
 private object JcaAlgorithmMapper {
+    private fun unsupportedDigest(digest: Int?): Nothing =
+        throw ServiceSpecificException(
+            KeystoreErrorCodes.unsupportedDigest,
+            "Unsupported digest: $digest",
+        )
+
+    /** RSA without padding signs the raw input, which no JCA Signature algorithm does. */
+    fun isRawRsaSignature(params: KeyMintAttestation): Boolean =
+        params.algorithm == Algorithm.RSA && params.padding.firstOrNull() == PaddingMode.NONE
+
     fun mapSignatureAlgorithm(params: KeyMintAttestation): String {
         val digest =
-            when (params.digest.firstOrNull()) {
+            when (val d = params.digest.firstOrNull()) {
+                null,
+                Digest.NONE -> "NONE"
+                Digest.MD5 -> "MD5"
+                Digest.SHA1 -> "SHA1"
+                Digest.SHA_2_224 -> "SHA224"
                 Digest.SHA_2_256 -> "SHA256"
                 Digest.SHA_2_384 -> "SHA384"
                 Digest.SHA_2_512 -> "SHA512"
-                else -> "NONE"
+                else -> unsupportedDigest(d)
             }
         return when (params.algorithm) {
             Algorithm.EC -> "${digest}withECDSA"
@@ -131,12 +146,47 @@ private object JcaAlgorithmMapper {
         }
 
     fun mapMacAlgorithm(params: KeyMintAttestation): String =
-        when (params.digest.firstOrNull()) {
+        when (val d = params.digest.firstOrNull()) {
+            Digest.SHA1 -> "HmacSHA1"
+            Digest.SHA_2_224 -> "HmacSHA224"
             Digest.SHA_2_256 -> "HmacSHA256"
             Digest.SHA_2_384 -> "HmacSHA384"
             Digest.SHA_2_512 -> "HmacSHA512"
-            else -> "HmacSHA256"
+            else -> unsupportedDigest(d)
         }
+}
+
+/**
+ * RSA signing with PaddingMode.NONE: the input, left-padded with zeros to the modulus size, goes
+ * through the raw private-key operation. NONEwithRSA would wrap it in PKCS#1 v1.5 padding instead.
+ */
+private class RawRsaSigner(keyPair: KeyPair) : CryptoPrimitive {
+    private val privateKey = keyPair.private as java.security.interfaces.RSAPrivateKey
+    private val buffer = java.io.ByteArrayOutputStream()
+
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) buffer.write(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray {
+        if (data != null) update(data)
+        val modulusBytes = (privateKey.modulus.bitLength() + 7) / 8
+        val input = buffer.toByteArray()
+        if (input.size > modulusBytes) {
+            throw ServiceSpecificException(KeystoreErrorCodes.invalidInputLength, "Input too long")
+        }
+        val padded = ByteArray(modulusBytes - input.size) + input
+        if (java.math.BigInteger(1, padded) >= privateKey.modulus) {
+            throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument, "Input too large")
+        }
+        return Cipher.getInstance("RSA/ECB/NoPadding").run {
+            init(Cipher.ENCRYPT_MODE, privateKey)
+            doFinal(padded)
+        }
+    }
+
+    override fun abort() {}
 }
 
 private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
@@ -199,16 +249,29 @@ private class CipherPrimitive(
     private val cipher: Cipher =
         Cipher.getInstance(JcaAlgorithmMapper.mapCipherAlgorithm(params)).apply {
             val nonce = params.nonce
-            if (nonce != null && isAead) {
-                init(opMode, cryptoKey, javax.crypto.spec.GCMParameterSpec(128, nonce))
+            // AuthorizeCreate has validated MAC_LENGTH; 128 bits when the caller left it out.
+            val gcmTagBits = params.macLength ?: 128
+            if (isAead) {
+                // An encryption without a caller nonce gets a fresh 96-bit one, returned to the
+                // caller through the begin parameters; the tag length must be set either way.
+                if (nonce == null && opMode == Cipher.DECRYPT_MODE) {
+                    throw ServiceSpecificException(
+                        KeystoreErrorCodes.invalidArgument,
+                        "GCM decryption requires a nonce",
+                    )
+                }
+                val iv = nonce ?: ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+                init(opMode, cryptoKey, javax.crypto.spec.GCMParameterSpec(gcmTagBits, iv))
             } else if (nonce != null) {
                 init(opMode, cryptoKey, javax.crypto.spec.IvParameterSpec(nonce))
             } else if (params.padding.firstOrNull() == PaddingMode.RSA_OAEP) {
                 val mainDigest = JcaAlgorithmMapper.mapOaepDigest(params.digest.firstOrNull())
+                // KeyMint's MGF1 digest defaults to SHA-1 when the caller names none, not to the
+                // main digest.
                 val mgfDigest =
                     params.rsaOaepMgfDigest.firstOrNull()?.let {
                         JcaAlgorithmMapper.mapOaepDigest(it)
-                    } ?: mainDigest
+                    } ?: "SHA-1"
                 init(
                     opMode,
                     cryptoKey,
@@ -297,10 +360,6 @@ private class MacPrimitive(
     override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         if (data != null) mac.update(data)
         val full = mac.doFinal()
-        // Tag.MAC_LENGTH is optional on the AndroidKeyStore Mac SPI; default to the
-        // full digest length so real Mac use keeps working when it is omitted.
-        val tagBytes = (params.macLength ?: (full.size * 8)) / 8
-        val tag = full.copyOf(tagBytes)
         if (params.purpose.firstOrNull() == KeyPurpose.VERIFY) {
             if (signature == null) {
                 throw ServiceSpecificException(
@@ -308,7 +367,16 @@ private class MacPrimitive(
                     "MAC to verify is null",
                 )
             }
-            if (!java.security.MessageDigest.isEqual(tag, signature)) {
+            // A verification carries no MAC_LENGTH: the tag is as long as the MAC handed in,
+            // which may be no shorter than the key's MIN_MAC_LENGTH.
+            val minBits = params.minMacLength ?: 0
+            if (signature.size * 8 < minBits || signature.size > full.size) {
+                throw ServiceSpecificException(
+                    KeystoreErrorCodes.invalidMacLength,
+                    "MAC length ${signature.size * 8} outside [$minBits, ${full.size * 8}]",
+                )
+            }
+            if (!java.security.MessageDigest.isEqual(full.copyOf(signature.size), signature)) {
                 throw ServiceSpecificException(
                     KeystoreErrorCodes.verificationFailed,
                     "MAC verification failed",
@@ -316,6 +384,8 @@ private class MacPrimitive(
             }
             return null
         }
+        // AuthorizeCreate has validated MAC_LENGTH; the full digest when the caller left it out.
+        val tag = full.copyOf((params.macLength ?: (full.size * 8)) / 8)
         SystemLogger.debug {
             "[SoftwareOp TX_ID: $txId] hmac-op digest=${params.digest.firstOrNull()} " +
                 "macLen=${params.macLength} tag=${tag.size}B result=ok"
@@ -338,7 +408,19 @@ class SoftwareOperation(
     var finalized = false
         private set
 
-    var onFinishCallback: (() -> Unit)? = null
+    /**
+     * Called exactly once when the operation ends: true after a successful finish, false after an
+     * abort or a failure. Like KeyMint, any error ends the operation.
+     */
+    var onEnd: ((Boolean) -> Unit)? = null
+
+    private fun end(success: Boolean) {
+        synchronized(this) {
+            if (finalized) return
+            finalized = true
+        }
+        onEnd?.invoke(success)
+    }
 
     val beginParameters: KeyParameters?
         get() {
@@ -397,7 +479,8 @@ class SoftwareOperation(
                                     KeystoreErrorCodes.invalidArgument,
                                     "[SoftwareOp TX_ID: $txId] SIGN requested but keyPair is null",
                                 )
-                        Signer(kp, params)
+                        if (JcaAlgorithmMapper.isRawRsaSignature(params)) RawRsaSigner(kp)
+                        else Signer(kp, params)
                     }
                     KeyPurpose.VERIFY -> {
                         val kp =
@@ -481,6 +564,7 @@ class SoftwareOperation(
             SystemLogger.info(
                 "[SoftwareOp TX_ID: $txId] updateAad() THREW class=${throwable::class.java.name} code=$code msg=${throwable.message} top=$top"
             )
+            end(success = false)
             throw throwable
         }
     }
@@ -492,9 +576,11 @@ class SoftwareOperation(
         try {
             return primitive.update(data)
         } catch (e: ServiceSpecificException) {
+            end(success = false)
             throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
+            end(success = false)
             throw mapToServiceSpecificException(e)
         }
     }
@@ -510,20 +596,23 @@ class SoftwareOperation(
                 val delayMs = latencyFloorMs - elapsedMs
                 if (delayMs > 0) LockSupport.parkNanos(delayMs * 1_000_000)
             }
-            finalized = true
-            onFinishCallback?.invoke()
+            end(success = true)
             SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
             return result
         } catch (e: ServiceSpecificException) {
+            end(success = false)
             throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to finish operation.", e)
+            end(success = false)
             throw mapToServiceSpecificException(e)
         }
     }
 
     fun abort() {
-        finalized = true
+        // Aborting an operation that already ended is an invalid handle, as on KeyMint.
+        checkActive()
+        end(success = false)
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
     }
@@ -617,6 +706,14 @@ internal object KeystoreErrorCodes {
 
     val invalidMacLength: Int by lazy {
         resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_MAC_LENGTH", -57)
+    }
+
+    val unsupportedMacLength: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "UNSUPPORTED_MAC_LENGTH", -9)
+    }
+
+    val unsupportedDigest: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "UNSUPPORTED_DIGEST", -12)
     }
 
     fun resolveField(className: String, fieldName: String, fallback: Int): Int =

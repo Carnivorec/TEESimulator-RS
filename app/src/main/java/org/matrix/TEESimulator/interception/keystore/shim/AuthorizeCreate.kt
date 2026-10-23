@@ -2,6 +2,7 @@ package org.matrix.TEESimulator.interception.keystore.shim
 
 import android.hardware.security.keymint.Algorithm
 import android.hardware.security.keymint.BlockMode
+import android.hardware.security.keymint.Digest
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.PaddingMode
@@ -61,16 +62,32 @@ object AuthorizeCreate {
             return KeystoreErrorCodes.incompatibleDigest
         }
 
-        if (keyParams.algorithm == Algorithm.AES && opParams.blockMode.contains(BlockMode.GCM)) {
-            val requestedMacLength = opParams.minMacLength
-            val keyMinMacLength = keyParams.minMacLength
-            if (
-                requestedMacLength != null &&
-                    keyMinMacLength != null &&
-                    requestedMacLength < keyMinMacLength
-            ) {
-                return KeystoreErrorCodes.invalidMacLength
-            }
+        // MAC_LENGTH of the operation, against the key's MIN_MAC_LENGTH (KeyMint begin()).
+        val macLength = opParams.macLength
+        val purpose = opParams.purpose.firstOrNull()
+        if (
+            macLength != null &&
+                keyParams.algorithm == Algorithm.AES &&
+                (opParams.blockMode.firstOrNull() ?: keyParams.blockMode.firstOrNull()) ==
+                    BlockMode.GCM
+        ) {
+            if (macLength % 8 != 0 || macLength < 96 || macLength > 128)
+                return KeystoreErrorCodes.unsupportedMacLength
+            if (macLength < (keyParams.minMacLength ?: 0)) return KeystoreErrorCodes.invalidMacLength
+        }
+        if (macLength != null && keyParams.algorithm == Algorithm.HMAC && purpose == KeyPurpose.SIGN) {
+            val digestBits =
+                when (opParams.digest.firstOrNull() ?: keyParams.digest.firstOrNull()) {
+                    Digest.SHA1 -> 160
+                    Digest.SHA_2_224 -> 224
+                    Digest.SHA_2_256 -> 256
+                    Digest.SHA_2_384 -> 384
+                    Digest.SHA_2_512 -> 512
+                    else -> return KeystoreErrorCodes.unsupportedDigest
+                }
+            if (macLength % 8 != 0 || macLength > digestBits)
+                return KeystoreErrorCodes.unsupportedMacLength
+            if (macLength < (keyParams.minMacLength ?: 0)) return KeystoreErrorCodes.invalidMacLength
         }
 
         if (
