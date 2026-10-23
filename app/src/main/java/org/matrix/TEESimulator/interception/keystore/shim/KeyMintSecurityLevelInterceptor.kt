@@ -14,6 +14,7 @@ import android.os.Parcel
 import android.system.keystore2.*
 import android.util.Pair as AndroidPair
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.SecureRandom
@@ -1904,31 +1905,47 @@ class KeyMintSecurityLevelInterceptor(
                 )
         }
 
+        /** Archives software keys before clearing other caches. Must run on the persist thread. */
+        fun releaseUidKeys(uid: Int, label: String, directory: File? = null): Int {
+            val software = generatedKeys.keys.filter { it.uid == uid }
+            var archived = 0
+            software.forEach { keyId ->
+                generatedKeys.remove(keyId)
+                if (GeneratedKeyPersistence.archive(keyId, label, directory)) archived++
+            }
+            clearNamespaceKeys(uid)
+            softwareGrants.entries.removeIf { (_, grant) -> grant.ownerKeyId.uid == uid }
+            return archived
+        }
+
         /**
          * Removes every key of Android user [userId] (maintenance.onUserRemoved). The files are
          * moved to the backup directory rather than deleted, and the user id may be reused later:
          * left in place, the keys would surface for whichever app is installed under the old uid.
          */
         fun clearUserKeys(userId: Int) {
-            val uids = cachedKeyIds().filter { it.uid / 100000 == userId }.map { it.uid }.toSet()
-            for (uid in uids) {
-                val software = generatedKeys.keys.filter { it.uid == uid }
-                software.forEach { keyId ->
-                    generatedKeys.remove(keyId)
-                    persist {
-                        if (!generatedKeys.containsKey(keyId))
-                            GeneratedKeyPersistence.archive(keyId, "user$userId-removed")
+            persistExecutor
+                .submit(
+                    Callable<Unit> {
+                        val uids =
+                            cachedKeyIds()
+                                .filter { it.uid / 100000 == userId }
+                                .map { it.uid }
+                                .toSet()
+                        for (uid in uids) releaseUidKeys(uid, "user$userId-removed")
+                        // A uid that only holds a grant has nothing cached of its own, so the loop
+                        // above never reaches it; its grants must not outlive the user either.
+                        softwareGrants.entries.removeIf { (_, grant) ->
+                            grant.granteeUid / 100000 == userId ||
+                                grant.ownerKeyId.uid / 100000 == userId
+                        }
+                        if (uids.isNotEmpty())
+                            SystemLogger.info(
+                                "Cleared cached keys of ${uids.size} uids for removed user $userId"
+                            )
                     }
-                }
-                clearNamespaceKeys(uid)
-            }
-            // A uid that only holds a grant has nothing cached of its own, so the loop above never
-            // reaches it; its grants must not outlive the user either.
-            softwareGrants.entries.removeIf { (_, grant) ->
-                grant.granteeUid / 100000 == userId || grant.ownerKeyId.uid / 100000 == userId
-            }
-            if (uids.isNotEmpty())
-                SystemLogger.info("Cleared cached keys of ${uids.size} uids for removed user $userId")
+                )
+                .get()
         }
 
         /** The alias of a real key whose metadata is cached, addressed by KEY_ID. */

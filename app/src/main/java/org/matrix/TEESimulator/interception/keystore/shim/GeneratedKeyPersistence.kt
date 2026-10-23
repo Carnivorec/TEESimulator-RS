@@ -228,21 +228,48 @@ object GeneratedKeyPersistence {
 
     private val BACKUP_DIR = File("/data/adb/tricky_store_backup")
 
-    private fun archiveDir(label: String): File =
+    fun archiveDir(label: String): File =
         File(BACKUP_DIR, "$label-${System.currentTimeMillis()}").apply { mkdirs() }
 
-    /** Moves the key file of [keyId] into a fresh backup directory instead of deleting it. */
-    fun archive(keyId: KeyIdentifier, label: String) {
+    /** Moves the key file of [keyId] into [directory] or a fresh backup directory. */
+    fun archive(keyId: KeyIdentifier, label: String, directory: File? = null): Boolean =
         runCatching {
                 val name = keyFileName(keyId.uid, keyId.alias)
                 val file = File(PERSISTENCE_DIR, name)
-                if (!file.exists()) return
-                if (!file.renameTo(File(archiveDir(label), name)))
-                    throw IOException("rename failed for ${file.name}")
-                fileLocks.remove(name)
+                if (!file.exists()) return false
+                archiveFile(file, directory ?: archiveDir(label))
                 SystemLogger.info("Archived persisted key $keyId to $BACKUP_DIR ($label)")
+                true
             }
             .onFailure { e -> SystemLogger.error("Failed to archive persisted key $keyId", e) }
+            .getOrDefault(false)
+
+    private fun archiveFile(file: File, directory: File) {
+        if (!file.renameTo(File(directory, file.name)))
+            throw IOException("rename failed for ${file.name}")
+        fileLocks.remove(file.name)
+    }
+
+    /** Includes files whose key material could not be restored into memory. */
+    fun archiveUid(uid: Int, directory: File): Int {
+        val files = PERSISTENCE_DIR.listFiles { _, name -> name.endsWith(".bin") } ?: return 0
+        var archived = 0
+        for (file in files) {
+            val matches =
+                runCatching {
+                        DataInputStream(BufferedInputStream(FileInputStream(file))).use { input ->
+                            input.readInt()
+                            input.readInt()
+                            input.readInt() == uid
+                        }
+                    }
+                    .getOrDefault(false)
+            if (matches) {
+                archiveFile(file, directory)
+                archived++
+            }
+        }
+        return archived
     }
 
     /**

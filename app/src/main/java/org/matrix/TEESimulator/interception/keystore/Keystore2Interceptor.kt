@@ -166,6 +166,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 }
                 .onFailure { SystemLogger.error("Failed to prepare $label SecurityLevel.", it) }
         }
+        ConfigurationManager.onPersistedKeysLoaded()
     }
 
     /**

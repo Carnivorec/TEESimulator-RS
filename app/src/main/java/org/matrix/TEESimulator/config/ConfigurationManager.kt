@@ -6,8 +6,11 @@ import android.os.FileObserver
 import android.os.IBinder
 import android.os.ServiceManager
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.TEESimulator.attestation.DeviceAttestationService
+import org.matrix.TEESimulator.interception.keystore.shim.GeneratedKeyPersistence
+import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
 import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.pki.KeyBoxManager
 
@@ -32,6 +35,7 @@ object ConfigurationManager {
     const val CONFIG_PATH = "/data/adb/tricky_store"
     private const val TARGET_PACKAGES_FILE = "target.txt"
     private const val PATCH_LEVEL_FILE = "security_patch.txt"
+    private const val RELEASE_KEYS_FILE = "release_keys.txt"
     private const val DEFAULT_KEYBOX_FILE = "keybox.xml"
     private val configRoot = File(CONFIG_PATH)
 
@@ -40,6 +44,7 @@ object ConfigurationManager {
     @Volatile private var packageKeyboxes = mapOf<String, String>()
     @Volatile private var globalCustomPatchLevel: CustomPatchLevel? = null
     @Volatile private var packagePatchLevels = mapOf<String, CustomPatchLevel>()
+    @Volatile private var keyReleaseRequestsReady = false
 
     // Cache for UID to package name resolution. Entries expire, so a uid reused by a newly
     // installed package does not keep the old package's configuration.
@@ -315,6 +320,70 @@ object ConfigurationManager {
         }
     }
 
+    /** Called after both security levels have finished restoring their software keys. */
+    fun onPersistedKeysLoaded() {
+        keyReleaseRequestsReady = true
+        processKeyReleaseRequest()
+    }
+
+    private fun processKeyReleaseRequest() {
+        if (!keyReleaseRequestsReady) return
+        KeyMintSecurityLevelInterceptor.persist {
+            val request = File(configRoot, RELEASE_KEYS_FILE)
+            if (!request.exists()) return@persist
+            try {
+                val releasedUids = mutableSetOf<Int>()
+                val results =
+                    request
+                        .readLines()
+                        .map(::cleanLine)
+                        .filter { it.isNotEmpty() && !it.startsWith("#") }
+                        .map { packageName ->
+                            val result =
+                                try {
+                                    releasePackageKeys(packageName, releasedUids)
+                                } catch (e: Exception) {
+                                    "FAILED ${e.message ?: e.javaClass.simpleName}"
+                                }
+                            SystemLogger.info("$packageName\t$result")
+                            "$packageName\t$result"
+                        }
+                val done = File(configRoot, "$RELEASE_KEYS_FILE.done")
+                val temporary = File(configRoot, "$RELEASE_KEYS_FILE.done.tmp")
+                temporary.writeText(
+                    results.joinToString("\n", postfix = if (results.isEmpty()) "" else "\n")
+                )
+                if (!temporary.renameTo(done))
+                    throw IOException("Failed to rename $temporary to $done")
+                if (!request.delete()) throw IOException("Failed to delete $request")
+            } catch (e: Exception) {
+                SystemLogger.error("Failed to process $RELEASE_KEYS_FILE", e)
+            }
+        }
+    }
+
+    private fun releasePackageKeys(packageName: String, releasedUids: MutableSet<Int>): String {
+        val pm = getPackageManager() ?: return "FAILED package manager unavailable"
+        val packageInfo =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                pm.getPackageInfo(packageName, 0L, 0)
+            else pm.getPackageInfo(packageName, 0, 0)
+        val uid = packageInfo?.applicationInfo?.uid ?: return "FAILED package not found"
+        if (uid in releasedUids) return "OK uid=$uid already released in this request"
+        if (isSystemUid(uid)) return "REFUSED uid=$uid system uid"
+        if (!shouldSkipUid(uid)) return "REFUSED uid=$uid still in target"
+
+        val label = "released-$uid"
+        val directory = GeneratedKeyPersistence.archiveDir(label)
+        val archived =
+            KeyMintSecurityLevelInterceptor.releaseUidKeys(uid, label, directory) +
+                GeneratedKeyPersistence.archiveUid(uid, directory)
+        releasedUids.add(uid)
+        val dir = if (archived > 0) " dir=${directory.absolutePath}" else ""
+        val packages = getPackagesForUid(uid).joinToString(",")
+        return "OK uid=$uid archived=$archived$dir packages=$packages"
+    }
+
     /**
      * A FileObserver that monitors the configuration directory for changes and triggers reloads of
      * the relevant settings.
@@ -324,13 +393,18 @@ object ConfigurationManager {
         override fun onEvent(event: Int, path: String?) {
             path ?: return
             // Other files here (.health_state, key backups) change all the time and are not ours.
-            if (path != TARGET_PACKAGES_FILE && path != PATCH_LEVEL_FILE && !path.endsWith(".xml"))
+            if (
+                path != TARGET_PACKAGES_FILE && path != PATCH_LEVEL_FILE &&
+                    path != RELEASE_KEYS_FILE && !path.endsWith(".xml")
+            )
                 return
+            if (path == RELEASE_KEYS_FILE && (event and (CLOSE_WRITE or MOVED_TO)) == 0) return
             SystemLogger.info("Configuration file change detected: $path (event: $event)")
 
             // A file moved away is gone just like a deleted one: its settings stop applying.
             val removed = (event and (DELETE or MOVED_FROM)) != 0
             when (path) {
+                RELEASE_KEYS_FILE -> processKeyReleaseRequest()
                 TARGET_PACKAGES_FILE ->
                     if (removed) {
                         SystemLogger.warning("$TARGET_PACKAGES_FILE was removed; no app is targeted.")
