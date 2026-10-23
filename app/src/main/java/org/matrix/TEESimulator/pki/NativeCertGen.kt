@@ -52,8 +52,9 @@ data class CertGenConfig(
     val callerNonce: Boolean = false,
     val unlockedDeviceRequired: Boolean = false,
     val noAuthRequired: Boolean = true,
-    // USER_AUTH_TYPE and AUTH_TIMEOUT of an auth-bound key; -1 when not set.
-    val userAuthType: Int = -1,
+    // USER_AUTH_TYPE and AUTH_TIMEOUT of an auth-bound key; -1 when not set. USER_AUTH_TYPE is a
+    // 32-bit mask passed as its unsigned value: ANY (0xFFFFFFFF) is -1 as an Int.
+    val userAuthType: Long = -1L,
     val authTimeout: Int = -1,
     // Diagnostic plane: the calling app UID keys the native log lines, and debugLogging mirrors the
     // APK debug variant so the native extension dump is silent in release.

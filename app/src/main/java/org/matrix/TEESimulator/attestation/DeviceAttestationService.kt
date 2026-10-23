@@ -70,7 +70,24 @@ object DeviceAttestationService {
     private const val TEE_REPROBE_INTERVAL_MS = 30_000L
 
     @Volatile private var teeVerdict: Boolean? = null
+    @Volatile private var teeVerdictAtMs = 0L
     @Volatile private var lastTeeProbeMs = 0L
+
+    /**
+     * Before API 33 a keystore failure cannot be told transient or permanent, so every one counts
+     * as permanent (see [isAttestationUnavailable]): the software fallback starts at once. Such a
+     * negative verdict is only a guess, though, and a hardware hiccup must not pin it until the next
+     * reboot, so it is probed again once this long has passed. From API 33 on a negative verdict is
+     * definitive and kept.
+     */
+    private const val GUESSED_NEGATIVE_TTL_MS = 5 * 60_000L
+
+    private val canTellTransient: Boolean
+        get() = android.os.Build.VERSION.SDK_INT >= 33
+
+    /** Whether a negative verdict reached at [atMs] was a guess that is due for a new probe. */
+    private fun isGuessedNegativeExpired(atMs: Long, now: Long): Boolean =
+        !canTellTransient && now - atMs >= GUESSED_NEGATIVE_TTL_MS
     private val teeProbeInFlight = AtomicBoolean(false)
 
     /**
@@ -82,15 +99,24 @@ object DeviceAttestationService {
      */
     val isTeeFunctional: Boolean
         get() {
-            teeVerdict?.let { return it }
             val now = android.os.SystemClock.elapsedRealtime()
+            teeVerdict?.let { if (it || !isGuessedNegativeExpired(teeVerdictAtMs, now)) return it }
             if (
                 (lastTeeProbeMs == 0L || now - lastTeeProbeMs >= TEE_REPROBE_INTERVAL_MS) &&
                     teeProbeInFlight.compareAndSet(false, true)
             ) {
                 try {
-                    lastTeeProbeMs = now
-                    teeVerdict = checkTeeFunctionality()
+                    // As for the attestation verdicts: the verdict is only written while holding
+                    // the flag, so recheck it in case another probe settled it meanwhile.
+                    val standing = teeVerdict
+                    if (
+                        standing == null ||
+                            (!standing && isGuessedNegativeExpired(teeVerdictAtMs, now))
+                    ) {
+                        lastTeeProbeMs = now
+                        teeVerdict = checkTeeFunctionality()
+                        teeVerdictAtMs = now
+                    }
                 } finally {
                     teeProbeInFlight.set(false)
                 }
@@ -118,6 +144,7 @@ object DeviceAttestationService {
         ProbeSpec(KeyProperties.KEY_ALGORITHM_EC, true, "TEESimulator_EcAttestCheckSb")
 
     private val attestableVerdicts = ConcurrentHashMap<String, Boolean>()
+    private val attestableVerdictAtMs = ConcurrentHashMap<String, Long>()
     private val attestProbesInFlight = ConcurrentHashMap<String, AtomicBoolean>()
 
     /**
@@ -136,13 +163,32 @@ object DeviceAttestationService {
     fun isEcAttestable(strongBox: Boolean): Boolean =
         isHardwareAttestable(if (strongBox) ecStrongBoxProbe else ecTeeProbe)
 
+    /** The cached verdict for [alias], unless it is a guess that has expired. */
+    private fun standingAttestableVerdict(alias: String, now: Long): Boolean? =
+        attestableVerdicts[alias]?.takeIf {
+            it || !isGuessedNegativeExpired(attestableVerdictAtMs[alias] ?: 0L, now)
+        }
+
     private fun isHardwareAttestable(probe: ProbeSpec): Boolean {
-        attestableVerdicts[probe.keyAlias]?.let { return it }
+        val now = android.os.SystemClock.elapsedRealtime()
+        standingAttestableVerdict(probe.keyAlias, now)?.let { return it }
         val probeInFlight =
             attestProbesInFlight.computeIfAbsent(probe.keyAlias) { AtomicBoolean(false) }
         if (probeInFlight.compareAndSet(false, true)) {
             try {
-                probeAttestability(probe)?.let { attestableVerdicts[probe.keyAlias] = it }
+                // Verdicts are only written while holding the flag. Another probe may have
+                // settled this one between the read above and taking it; if not, what is cached
+                // now is nothing or an expired guess, and only that may be replaced.
+                if (standingAttestableVerdict(probe.keyAlias, now) == null) {
+                    val verdict = probeAttestability(probe)
+                    if (verdict != null) {
+                        attestableVerdicts[probe.keyAlias] = verdict
+                        attestableVerdictAtMs[probe.keyAlias] = now
+                    } else {
+                        // Inconclusive: the expired guess no longer stands; capable is the default.
+                        attestableVerdicts.remove(probe.keyAlias)
+                    }
+                }
             } finally {
                 probeInFlight.set(false)
             }
@@ -233,6 +279,9 @@ object DeviceAttestationService {
     private fun recordTeeCheck(message: String, error: Throwable?) {
         if (error == null) SystemLogger.info(message) else SystemLogger.warning(message, error)
         runCatching {
+            // The logs directory is otherwise made by libcertgen's logger, which is exactly what
+            // may have failed to load when this record is needed.
+            teeCheckLog.parentFile?.mkdirs()
             if (teeCheckLog.length() > TEE_CHECK_LOG_MAX_BYTES)
                 teeCheckLog.renameTo(java.io.File(teeCheckLog.path + ".old"))
             val time = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
@@ -303,10 +352,15 @@ object DeviceAttestationService {
      * support; [KeyStoreException.isTransientFailure] draws the transient/permanent line.
      */
     private fun isAttestationUnavailable(error: Throwable): Boolean {
+        // isTransientFailure arrived in API 33; calling it earlier throws NoSuchMethodError, which
+        // no `catch (Exception)` stops. Without it any keystore failure counts as permanent, as
+        // every failure did before the check learned to retry: treating none as permanent would
+        // keep a broken TEE in use forever, with no software fallback. Such a verdict expires
+        // after GUESSED_NEGATIVE_TTL_MS.
         var cause: Throwable? = error
         while (cause != null) {
             val keyStoreError = cause as? KeyStoreException
-            if (keyStoreError != null) return !keyStoreError.isTransientFailure
+            if (keyStoreError != null) return !canTellTransient || !keyStoreError.isTransientFailure
             cause = cause.cause
         }
         return false

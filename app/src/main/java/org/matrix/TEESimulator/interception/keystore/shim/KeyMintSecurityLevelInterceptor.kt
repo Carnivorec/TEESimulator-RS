@@ -59,7 +59,23 @@ class KeyMintSecurityLevelInterceptor(
         val nspace: Long,
         val response: KeyEntryResponse,
         val keyParams: KeyMintAttestation? = null,
-    )
+    ) {
+        /**
+         * The USAGE_COUNT_LIMIT budget of this key instance. It lives with the instance, so a key
+         * regenerated under the same alias starts afresh and an operation still holding the old
+         * key never spends the new key's uses. Not persisted: a reboot restores the full budget.
+         */
+        val usage: UsageBudget? = keyParams?.usageCountLimit?.let { UsageBudget(it) }
+    }
+
+    /**
+     * Uses not yet reserved by an operation, and uses spent by operations that finished. Only the
+     * latter decides when the key is exhausted.
+     */
+    class UsageBudget(val limit: Int) {
+        val remaining = java.util.concurrent.atomic.AtomicInteger(limit)
+        val consumed = java.util.concurrent.atomic.AtomicInteger(0)
+    }
 
     private val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
 
@@ -164,7 +180,10 @@ class KeyMintSecurityLevelInterceptor(
             val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
             if (generatedKeys.remove(keyId) != null) {
                 SystemLogger.debug("Remove generated key on importKey $keyId")
-                persist { GeneratedKeyPersistence.delete(keyId) }
+                // As in cleanupKeyData: a generation committed since owns the file.
+                persist {
+                    if (!generatedKeys.containsKey(keyId)) GeneratedKeyPersistence.delete(keyId)
+                }
             }
             teeResponses.remove(keyId)
             patchedChains.remove(keyId)
@@ -403,6 +422,17 @@ class KeyMintSecurityLevelInterceptor(
                             // Real-HAL operations are left to keystore2 and the HAL, which manage
                             // their own slots (keystore2 prunes and retries on TOO_MANY_OPERATIONS).
                             entry
+                                // A grantee loads a granted key through Domain.GRANT and then
+                                // operates on the KEY_ID the owner's metadata names, which is not
+                                // under the grantee's uid.
+                                ?: findGrantedKeyByKeyId(callingUid, nspace)?.let { (grant, info) ->
+                                    if ((grant.accessVector and KEY_PERMISSION_USE) == 0) {
+                                        return InterceptorUtils.createServiceSpecificErrorReply(
+                                            RESPONSE_PERMISSION_DENIED
+                                        )
+                                    }
+                                    java.util.AbstractMap.SimpleEntry(grant.ownerKeyId, info)
+                                }
                                 ?: run {
                                     SystemLogger.info(
                                         "[TX_ID: $txId] createOperation KeyId(${keyDescriptor.nspace}) NOT FOUND for uid=$callingUid. Forwarding to HAL."
@@ -496,7 +526,9 @@ class KeyMintSecurityLevelInterceptor(
                                     keyParams.rsaOaepMgfDigest
                                 },
                             nonce = parsedParams.nonce,
-                            minMacLength = parsedParams.minMacLength ?: keyParams.minMacLength,
+                            // A key property: an operation may not lower the floor it verifies
+                            // MACs against.
+                            minMacLength = keyParams.minMacLength,
                             macLength = parsedParams.macLength,
                         )
                     } else parsedParams
@@ -516,33 +548,34 @@ class KeyMintSecurityLevelInterceptor(
                         opLatency,
                     )
 
-                if (keyParams?.usageCountLimit != null) {
-                    val limit = keyParams.usageCountLimit
-                    val remaining =
-                        usageCounters.computeIfAbsent(resolvedKeyId) {
-                            java.util.concurrent.atomic.AtomicInteger(limit)
-                        }
-                    // Only drop the key this operation was created for: the alias may have been
-                    // regenerated since, and the new key has a budget of its own.
-                    fun dropIfStillCurrent() {
-                        if (generatedKeys[resolvedKeyId] === generatedKeyInfo)
-                            cleanupKeyData(resolvedKeyId)
-                    }
+                val usage = generatedKeyInfo.usage
+                if (usage != null) {
+                    val limit = usage.limit
                     // A use is reserved up front, so concurrent operations cannot overrun the
-                    // limit; an operation that does not finish gives its use back.
+                    // limit; an operation that does not finish gives its use back. A failed
+                    // reservation only means the uses are taken by operations still in flight,
+                    // any of which may yet give its use back, so the key stays.
                     val reserved =
-                        remaining.getAndUpdate { if (it > 0) it - 1 else it } > 0
+                        usage.remaining.getAndUpdate { if (it > 0) it - 1 else it } > 0
                     if (!reserved) {
-                        dropIfStillCurrent()
                         return InterceptorUtils.createServiceSpecificErrorReply(
                             RESPONSE_KEY_NOT_FOUND
                         )
                     }
                     softwareOperation.onEnd = { success ->
                         if (!success) {
-                            remaining.incrementAndGet()
-                        } else if (remaining.get() <= 0) {
-                            dropIfStillCurrent()
+                            usage.remaining.incrementAndGet()
+                        } else if (usage.consumed.incrementAndGet() >= limit) {
+                            // Found and dropped on the persistence thread, where alias
+                            // replacements and migrations are committed: only the key this
+                            // operation was created for goes, never a newer key generated under
+                            // the alias, and it is found by identity wherever a migration put it.
+                            persist {
+                                generatedKeys.entries
+                                    .firstOrNull { it.value === generatedKeyInfo }
+                                    ?.key
+                                    ?.let { cleanupKeyData(it) }
+                            }
                             SystemLogger.info(
                                 "Key $resolvedKeyId exhausted (USAGE_COUNT_LIMIT=$limit)."
                             )
@@ -1175,7 +1208,7 @@ class KeyMintSecurityLevelInterceptor(
                         callerNonce = params.callerNonce == true,
                         unlockedDeviceRequired = params.unlockedDeviceRequired == true,
                         noAuthRequired = params.noAuthRequired == true,
-                        userAuthType = params.userAuthType ?: -1,
+                        userAuthType = params.userAuthType?.let { it.toLong() and 0xFFFFFFFFL } ?: -1L,
                         authTimeout = params.authTimeout ?: -1,
                         uid = callingUid,
                         debugLogging = SystemLogger.isDebugBuild,
@@ -1684,8 +1717,6 @@ class KeyMintSecurityLevelInterceptor(
         val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
         val attestationKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
         val importedKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
-        private val usageCounters =
-            ConcurrentHashMap<KeyIdentifier, java.util.concurrent.atomic.AtomicInteger>()
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
         /**
@@ -1721,6 +1752,18 @@ class KeyMintSecurityLevelInterceptor(
         }
 
         /** Caller-bound resolve: only the designated grantee, only while the key exists. */
+        /** A software key granted to [callerUid], addressed by the KEY_ID its metadata names. */
+        fun findGrantedKeyByKeyId(
+            callerUid: Int,
+            nspace: Long?,
+        ): Pair<SoftwareGrant, GeneratedKeyInfo>? {
+            if (nspace == null || nspace == 0L) return null
+            return softwareGrants.values.firstNotNullOfOrNull { grant ->
+                if (grant.granteeUid != callerUid) null
+                else generatedKeys[grant.ownerKeyId]?.takeIf { it.nspace == nspace }?.let { grant to it }
+            }
+        }
+
         fun resolveGrant(grantId: Long, callerUid: Int): SoftwareGrant? =
             softwareGrants[grantId]?.takeIf {
                 it.granteeUid == callerUid && ownsKeyResponse(it.ownerKeyId)
@@ -1813,7 +1856,13 @@ class KeyMintSecurityLevelInterceptor(
             purgeGrantsForKey(keyId) // grants die with the key (Android 16 path; no-op pre-36)
             if (generatedKeys.remove(keyId) != null) {
                 SystemLogger.debug("Remove generated key ${keyId}")
-                if (deleteFile) persist { GeneratedKeyPersistence.delete(keyId) }
+                // A generation committed for the alias after this removal (commits run on the
+                // persistence thread too) owns the file now; deleting it would lose that key on
+                // the next boot.
+                if (deleteFile)
+                    persist {
+                        if (!generatedKeys.containsKey(keyId)) GeneratedKeyPersistence.delete(keyId)
+                    }
             }
             teeResponses.remove(keyId)
             if (patchedChains.remove(keyId) != null) {
@@ -1823,7 +1872,6 @@ class KeyMintSecurityLevelInterceptor(
                 SystemLogger.debug("Remove cached attestaion key ${keyId}")
             }
             importedKeys.remove(keyId)
-            usageCounters.remove(keyId)
         }
 
         /** Whether anything is cached for [keyId]: a software key or a real key's metadata. */
@@ -1835,7 +1883,7 @@ class KeyMintSecurityLevelInterceptor(
 
         private fun cachedKeyIds(): Set<KeyIdentifier> =
             generatedKeys.keys + teeResponses.keys + patchedChains.keys + importedKeys +
-                attestationKeys + usageCounters.keys
+                attestationKeys
 
         /**
          * Clears everything cached for [uid] (maintenance.clearNamespace, Domain.APP): software
@@ -1867,9 +1915,17 @@ class KeyMintSecurityLevelInterceptor(
                 val software = generatedKeys.keys.filter { it.uid == uid }
                 software.forEach { keyId ->
                     generatedKeys.remove(keyId)
-                    persist { GeneratedKeyPersistence.archive(keyId, "user$userId-removed") }
+                    persist {
+                        if (!generatedKeys.containsKey(keyId))
+                            GeneratedKeyPersistence.archive(keyId, "user$userId-removed")
+                    }
                 }
                 clearNamespaceKeys(uid)
+            }
+            // A uid that only holds a grant has nothing cached of its own, so the loop above never
+            // reaches it; its grants must not outlive the user either.
+            softwareGrants.entries.removeIf { (_, grant) ->
+                grant.granteeUid / 100000 == userId || grant.ownerKeyId.uid / 100000 == userId
             }
             if (uids.isNotEmpty())
                 SystemLogger.info("Cleared cached keys of ${uids.size} uids for removed user $userId")
@@ -1896,6 +1952,9 @@ class KeyMintSecurityLevelInterceptor(
             val info = generatedKeys[srcId] ?: return
             val isAttestKey = attestationKeys.contains(srcId)
             persist {
+                // The source may have been deleted, exhausted or replaced while this waited; a
+                // stale instance must not be written back under the destination.
+                if (generatedKeys[srcId] !== info || generatedKeys.containsKey(dstId)) return@persist
                 if (!saveGeneratedKey(dstId, info, isAttestKey)) {
                     SystemLogger.error("Could not store migrated key $dstId; keeping $srcId")
                     return@persist
@@ -1974,10 +2033,12 @@ class KeyMintSecurityLevelInterceptor(
             patchedChains.clear()
             attestationKeys.clear()
             importedKeys.clear()
-            usageCounters.clear()
             softwareGrants.clear()
             // Moved aside, not deleted: this is the one path that would wipe every app's keys.
-            persist { GeneratedKeyPersistence.archiveAll("delete-all-keys") }
+            // Keys committed after the clear (commits run on this same thread) keep their files.
+            persist {
+                GeneratedKeyPersistence.archiveAll("delete-all-keys", except = generatedKeys.keys.toSet())
+            }
             SystemLogger.info("Cleared all cached keys ($count entries)$reasonMessage.")
         }
     }

@@ -297,7 +297,8 @@ object AttestationBuilder {
                     DERTaggedObject(
                         true,
                         AttestationConstants.TAG_USER_AUTH_TYPE,
-                        ASN1Integer(it.toLong()),
+                        // An unsigned 32-bit mask: ANY is 4294967295, not -1.
+                        ASN1Integer(it.toLong() and 0xFFFFFFFFL),
                     )
                 )
             }

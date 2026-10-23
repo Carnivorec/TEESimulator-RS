@@ -114,7 +114,7 @@ fn build_tee_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
         // Tag 504: USER_AUTH_TYPE, Tag 505: AUTH_TIMEOUT — INTEGER, for an auth-bound key, so
         // the attestation agrees with its KeyMetadata. USER_SECURE_ID is never attested.
         if params.user_auth_type >= 0 {
-            fields.push((504, enc_integer(params.user_auth_type as i64)));
+            fields.push((504, enc_integer(params.user_auth_type)));
         }
         if params.auth_timeout >= 0 {
             fields.push((505, enc_integer(params.auth_timeout as i64)));
@@ -595,6 +595,12 @@ mod tests {
         let tee = build_tee_enforced(&params).unwrap();
         let tags = extract_tag_numbers(skip_tlv_header(&tee));
         assert!(tags.contains(&504) && tags.contains(&505), "tags={tags:?}");
+
+        // ANY is the full 32-bit mask, attested as a positive INTEGER.
+        params.user_auth_type = 0xFFFF_FFFF;
+        let tee = build_tee_enforced(&params).unwrap();
+        let any = [0x02, 0x05, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(tee.windows(any.len()).any(|w| w == any), "USER_AUTH_TYPE=ANY not encoded unsigned");
 
         // Never alongside NO_AUTH_REQUIRED.
         params.no_auth_required = true;

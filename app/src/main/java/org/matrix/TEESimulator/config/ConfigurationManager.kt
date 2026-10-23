@@ -413,7 +413,8 @@ object ConfigurationManager {
     }
 
     fun getPackagesForUid(uid: Int): Array<String> {
-        val now = System.currentTimeMillis()
+        // Monotonic: a wall clock set back would keep stale entries alive indefinitely.
+        val now = android.os.SystemClock.elapsedRealtime()
         uidToPackagesCache[uid]
             ?.takeIf {
                 now - it.loadedAtMs <

@@ -368,8 +368,10 @@ private class MacPrimitive(
                 )
             }
             // A verification carries no MAC_LENGTH: the tag is as long as the MAC handed in,
-            // which may be no shorter than the key's MIN_MAC_LENGTH.
-            val minBits = params.minMacLength ?: 0
+            // which may be no shorter than the key's MIN_MAC_LENGTH. KeyMint never allows an
+            // HMAC MIN_MAC_LENGTH below 64, so a key restored without one still gets that floor;
+            // with none at all an empty MAC would verify.
+            val minBits = maxOf(params.minMacLength ?: 0, 64)
             if (signature.size * 8 < minBits || signature.size > full.size) {
                 throw ServiceSpecificException(
                     KeystoreErrorCodes.invalidMacLength,
@@ -547,13 +549,16 @@ class SoftwareOperation(
         }
     }
 
+    // Every entry point holds the operation's own lock, not just the binder's: the LRU pruner
+    // aborts directly, and must not refund a use while a finish is still producing its result.
+    @Synchronized
     fun updateAad(aadInput: ByteArray?) {
         SystemLogger.info(
             "[SoftwareOp TX_ID: $txId] updateAad() ENTRY inputSize=${aadInput?.size ?: 0} primitive=${primitive::class.simpleName}"
         )
         checkActive()
-        checkInputLength(aadInput)
         try {
+            checkInputLength(aadInput)
             primitive.updateAad(aadInput)
             SystemLogger.info(
                 "[SoftwareOp TX_ID: $txId] updateAad() RETURNED_NORMALLY (unexpected for non-AEAD)"
@@ -569,11 +574,12 @@ class SoftwareOperation(
         }
     }
 
+    @Synchronized
     fun update(data: ByteArray?): ByteArray? {
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] update() inputSize=${data?.size ?: 0}")
         checkActive()
-        checkInputLength(data)
         try {
+            checkInputLength(data)
             return primitive.update(data)
         } catch (e: ServiceSpecificException) {
             end(success = false)
@@ -585,10 +591,11 @@ class SoftwareOperation(
         }
     }
 
+    @Synchronized
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         checkActive()
-        checkInputLength(data)
         try {
+            checkInputLength(data)
             val startNs = if (latencyFloorMs > 0) System.nanoTime() else 0L
             val result = primitive.finish(data, signature)
             if (latencyFloorMs > 0) {
@@ -609,6 +616,7 @@ class SoftwareOperation(
         }
     }
 
+    @Synchronized
     fun abort() {
         // Aborting an operation that already ended is an invalid handle, as on KeyMint.
         checkActive()

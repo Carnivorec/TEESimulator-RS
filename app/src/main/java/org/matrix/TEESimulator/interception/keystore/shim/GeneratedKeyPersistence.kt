@@ -245,11 +245,16 @@ object GeneratedKeyPersistence {
             .onFailure { e -> SystemLogger.error("Failed to archive persisted key $keyId", e) }
     }
 
-    /** Moves every key file into a fresh backup directory instead of deleting it. */
-    fun archiveAll(label: String) {
+    /**
+     * Moves every key file, but those of [except], into a fresh backup directory instead of
+     * deleting it.
+     */
+    fun archiveAll(label: String, except: Set<KeyIdentifier> = emptySet()) {
         runCatching {
+                val kept = except.mapTo(HashSet()) { keyFileName(it.uid, it.alias) }
                 val files =
-                    PERSISTENCE_DIR.listFiles { _, name -> name.endsWith(".bin") } ?: return
+                    PERSISTENCE_DIR.listFiles { _, name -> name.endsWith(".bin") && name !in kept }
+                        ?: return
                 if (files.isEmpty()) return
                 val dir = archiveDir(label)
                 val moved = files.count { it.renameTo(File(dir, it.name)) }

@@ -171,6 +171,22 @@ object InterceptorUtils {
         errorCode: Int
     ): BinderInterceptor.TransactionResult.OverrideReply = createErrorReply(errorCode)
 
+    /** The error code a ServiceSpecificException reply carries; null for any other reply. */
+    fun serviceSpecificErrorCode(reply: Parcel): Int? {
+        reply.setDataPosition(0)
+        return try {
+            if (reply.readInt() != EX_SERVICE_SPECIFIC) null
+            else {
+                // Message and stack header come before the error code.
+                reply.readString()
+                reply.readInt()
+                reply.readInt()
+            }
+        } finally {
+            reply.setDataPosition(0)
+        }
+    }
+
     fun normalizeServiceSpecificReply(reply: Parcel): Parcel? {
         reply.setDataPosition(0)
         if (reply.readInt() != EX_SERVICE_SPECIFIC) {

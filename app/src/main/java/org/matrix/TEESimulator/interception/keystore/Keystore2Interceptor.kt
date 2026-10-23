@@ -96,6 +96,21 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             KeyIdentifier(callingUid, descriptor.alias)
         else null
 
+    /** A deleteKey request for the caller's own [keyAlias], as the framework sends it. */
+    private fun aliasDeleteRequest(keyAlias: String): Parcel =
+        Parcel.obtain().apply {
+            writeInterfaceToken(IKeystoreService.DESCRIPTOR)
+            writeTypedObject(
+                KeyDescriptor().apply {
+                    domain = Domain.APP
+                    nspace = -1L // KeyProperties.NAMESPACE_APPLICATION; keystore2 uses the caller
+                    alias = keyAlias
+                    blob = null
+                },
+                0,
+            )
+        }
+
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
     override val injectionCommand = "exec ./inject `pidof keystore2` libTEESimulator.so entry"
@@ -291,19 +306,23 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             // serves cached keys to them as well, or the framework's attestKeyAlias lookup gets
             // KEY_NOT_FOUND.
             if (code == DELETE_KEY_TRANSACTION) {
+                // A software key's KEY_ID is a number only we know; keystore2 knows its alias.
+                val softwareAlias =
+                    if (descriptor.domain == Domain.KEY_ID)
+                        KeyMintSecurityLevelInterceptor.findGeneratedAliasByKeyId(
+                            callingUid,
+                            descriptor.nspace,
+                        )
+                    else null
                 val keyId =
                     appKeyId(descriptor, callingUid)
-                        ?: if (descriptor.domain == Domain.KEY_ID) {
-                            KeyMintSecurityLevelInterceptor.findGeneratedAliasByKeyId(
-                                    callingUid,
-                                    descriptor.nspace,
-                                )
-                                ?.let { KeyIdentifier(callingUid, it) }
-                                ?: KeyMintSecurityLevelInterceptor.findTeeKeyIdByKeyId(
-                                    callingUid,
-                                    descriptor.nspace,
-                                )
-                        } else null
+                        ?: softwareAlias?.let { KeyIdentifier(callingUid, it) }
+                        ?: if (descriptor.domain == Domain.KEY_ID)
+                            KeyMintSecurityLevelInterceptor.findTeeKeyIdByKeyId(
+                                callingUid,
+                                descriptor.nspace,
+                            )
+                        else null
 
                 if (keyId != null) {
                     val isSoftwareKey =
@@ -316,7 +335,11 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         SystemLogger.info(
                             "[TX_ID: $txId] Deleted cached keypair ${keyId.alias}, forwarding to drop any real key."
                         )
-                        return TransactionResult.Continue
+                        // Addressed by the software KEY_ID, the real key would never be found;
+                        // keystore2 is asked by alias instead.
+                        return if (softwareAlias != null)
+                            TransactionResult.OverrideData(aliasDeleteRequest(softwareAlias))
+                        else TransactionResult.Continue
                     }
                 }
                 return TransactionResult.ContinueAndSkipPost
@@ -471,9 +494,18 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             return TransactionResult.SkipTransaction
         }
         // The software key is already gone; keystore2 usually has no real key under the alias and
-        // answers KEY_NOT_FOUND, which the caller must not see.
+        // answers KEY_NOT_FOUND, which the caller must not see. Any other failure is real: a real
+        // key may still be stored under the alias, and the caller has to know the delete failed.
         if (code == DELETE_KEY_TRANSACTION && pendingSoftwareDeletes.remove(txId)) {
-            return InterceptorUtils.createSuccessReply(writeResultCode = false)
+            val error = InterceptorUtils.serviceSpecificErrorCode(reply)
+            if (
+                resultCode == 0 &&
+                    (error == RESPONSE_KEY_NOT_FOUND || !InterceptorUtils.hasException(reply))
+            )
+                return InterceptorUtils.createSuccessReply(writeResultCode = false)
+            SystemLogger.warning(
+                "[TX_ID: $txId] keystore2 could not delete the real key under the alias (status=$resultCode error=$error); passing the failure on."
+            )
         }
         if (InterceptorUtils.hasException(reply)) {
             ListEntriesHandler.discard(txId)

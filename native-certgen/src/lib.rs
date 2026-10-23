@@ -190,7 +190,7 @@ fn extract_config(env: &mut JNIEnv, config: &JObject) -> Result<CertGenParams> {
     let caller_nonce = get_boolean(env, config, "callerNonce")?;
     let unlocked_device_required = get_boolean(env, config, "unlockedDeviceRequired")?;
     let no_auth_required = get_boolean(env, config, "noAuthRequired")?;
-    let user_auth_type = get_int(env, config, "userAuthType")?;
+    let user_auth_type = get_long(env, config, "userAuthType")?;
     let auth_timeout = get_int(env, config, "authTimeout")?;
     let uid = get_int(env, config, "uid")?;
     let debug_logging = get_boolean(env, config, "debugLogging")?;
