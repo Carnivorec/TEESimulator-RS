@@ -380,6 +380,9 @@ object ConfigurationManager {
             KeyMintSecurityLevelInterceptor.releaseUidKeys(uid, label, directory) +
                 GeneratedKeyPersistence.archiveUid(uid, directory)
         releasedUids.add(uid)
+        // Made up front so all of the uid's files share it; an app with no software key leaves
+        // it empty.
+        if (archived == 0) directory.delete()
         val dir = if (archived > 0) " dir=${directory.absolutePath}" else ""
         val packages = getPackagesForUid(uid).joinToString(",")
         return "OK uid=$uid archived=$archived$dir packages=$packages"
