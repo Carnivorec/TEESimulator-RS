@@ -3,6 +3,31 @@
 
 ---
 
+## TEESimulator-RS v6.0.1-324 (Carnivorec fork)
+
+Fixes from a full audit of v6.0.1-317, reviewed in several rounds. Focus: keys must survive every failure path, and a boot-time hiccup must not turn the whole boot into software keys.
+
+### Key safety
+- Interception starts only after the Bouncy Castle provider, the native cert generator and the persisted keys are ready; an early request can no longer replace a key still on disk.
+- A software key generation that fails (keybox, attest key, storage) keeps the alias's previous key.
+- Deleting a key also removes a real key under the same alias; a delete keystore2 really failed is reported, not hidden.
+- Maintenance events (clear namespace, delete all keys, user removed, migrate) change the module's state only after keystore2 succeeded; delete-all and user removal move key files to `/data/adb/tricky_store_backup/` instead of deleting them.
+- An app taken out of the target list no longer has its old cached key shadow the new real one.
+- Limited-use keys (`setMaxUsageCount`) are counted per key and safe under concurrent operations. The count still resets on reboot.
+
+### Correctness
+- TEE check: only a definitive result is cached; an inconclusive probe is retried instead of forcing generate mode for the whole boot. Results are appended to `/data/adb/tricky_store/logs/tee_check.log`.
+- Shared system uids (below 10000) are never targeted, even if listed in `target.txt`.
+- Software operations follow KeyMint: an error ends the operation; GCM tag length and nonce, HMAC MAC length and minimum, MD5/SHA-1/SHA-224 digests, raw RSA signing and the OAEP MGF1 default (SHA-1) are handled as on real hardware.
+- Even or too small RSA public exponents are rejected instead of hanging key generation.
+- Certificates: keyCertSign keys get a critical `BasicConstraints cA=TRUE`; auth-bound keys attest `USER_AUTH_TYPE`/`AUTH_TIMEOUT`; Ed25519/X25519 always come from the HAL.
+- A keybox whose private key does not match its leaf certificate is rejected (PEM and PKCS#8).
+- Config reloads handle moved/deleted files and UTF-8 BOMs; the uid→package cache expires.
+
+**Upgrade:** install over the existing module. Do not uninstall first.
+
+---
+
 ## TEESimulator-RS v6.0.1-317 (Carnivorec fork)
 
 Based on umud66 v6.0.1-311 (upstream 307 + PKCS#8 keybox support). Focus: never lose the user's keys, and stop breaking apps that rely on fingerprint-bound keys.
