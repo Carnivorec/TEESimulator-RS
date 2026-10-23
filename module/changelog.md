@@ -3,6 +3,23 @@
 
 ---
 
+## TEESimulator-RS v6.1.0-331 (Carnivorec fork)
+
+Includes all of v6.0.1-324 below.
+
+### AUTO mode
+- AUTO decides on whether the TEE can **attest** a key, not merely generate one. On a device whose TEE works but whose hardware attestation is revoked or broken, v6.0.1-324 handed every attested key of AUTO apps to that attestation and they all failed (e.g. chain verification failures, "TEE loss" in detector apps). AUTO now forges asymmetric keys and attestation while hardware attestation is unavailable, as v6.0.1-311 did; symmetric keys still go to the working TEE. Attestation is re-probed at most every 30s and AUTO switches to the genuine chain once it works.
+- Requests arriving while the first attestation probe runs wait for its result instead of being forged on hardware that attests fine.
+
+### Release an app's software keys
+- Write package names (one per line) to `/data/adb/tricky_store/release_keys.txt`. For each app no longer in `target.txt`, the module moves its software keys to `/data/adb/tricky_store_backup/released-<uid>-<time>/` (never deleted) and drops everything it cached for the app, **without a reboot**; the app then gets real hardware keys. Results go to `release_keys.txt.done` and the request file is removed.
+- Refused for apps still in `target.txt` and for system uids. The app has to rebuild its credentials afterwards (e.g. turn fingerprint unlock off and on).
+- Undo: move the files back to `persistent_keys/` and reboot, before the app has rebuilt its credentials.
+
+**Upgrade:** install over the existing module. Uninstalling keeps the keys since v6.0.1-317, but a boot without the module lets apps replace them.
+
+---
+
 ## TEESimulator-RS v6.0.1-324 (Carnivorec fork)
 
 Fixes from a full audit of v6.0.1-317, reviewed in several rounds. Focus: keys must survive every failure path, and a boot-time hiccup must not turn the whole boot into software keys.
