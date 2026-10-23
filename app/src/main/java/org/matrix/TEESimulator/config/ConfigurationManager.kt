@@ -332,27 +332,28 @@ object ConfigurationManager {
             val request = File(configRoot, RELEASE_KEYS_FILE)
             if (!request.exists()) return@persist
             try {
+                val packages =
+                    request.readLines().map(::cleanLine).filter {
+                        it.isNotEmpty() && !it.startsWith("#")
+                    }
+                // A file manager creates the file empty before anything is typed into it; leave it
+                // for the save that names a package rather than consume it.
+                if (packages.isEmpty()) return@persist
                 val releasedUids = mutableSetOf<Int>()
                 val results =
-                    request
-                        .readLines()
-                        .map(::cleanLine)
-                        .filter { it.isNotEmpty() && !it.startsWith("#") }
-                        .map { packageName ->
-                            val result =
-                                try {
-                                    releasePackageKeys(packageName, releasedUids)
-                                } catch (e: Exception) {
-                                    "FAILED ${e.message ?: e.javaClass.simpleName}"
-                                }
-                            SystemLogger.info("$packageName\t$result")
-                            "$packageName\t$result"
-                        }
+                    packages.map { packageName ->
+                        val result =
+                            try {
+                                releasePackageKeys(packageName, releasedUids)
+                            } catch (e: Exception) {
+                                "FAILED ${e.message ?: e.javaClass.simpleName}"
+                            }
+                        SystemLogger.info("$packageName\t$result")
+                        "$packageName\t$result"
+                    }
                 val done = File(configRoot, "$RELEASE_KEYS_FILE.done")
                 val temporary = File(configRoot, "$RELEASE_KEYS_FILE.done.tmp")
-                temporary.writeText(
-                    results.joinToString("\n", postfix = if (results.isEmpty()) "" else "\n")
-                )
+                temporary.writeText(results.joinToString("\n", postfix = "\n"))
                 if (!temporary.renameTo(done))
                     throw IOException("Failed to rename $temporary to $done")
                 if (!request.delete()) throw IOException("Failed to delete $request")
