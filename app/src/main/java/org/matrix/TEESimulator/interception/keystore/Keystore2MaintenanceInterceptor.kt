@@ -12,10 +12,9 @@ import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelIn
  * Intercepts the keystore2 daemon's `android.security.maintenance` binder so our synthetic key
  * state follows the same lifecycle events the platform applies to real keys.
  *
- * This is a pure side-effect hook: every handled transaction mutates only our own synthetic state
- * and then returns [TransactionResult.ContinueAndSkipPost], so the real keystore2 still performs
- * the real operation. We never fabricate a maintenance reply, so real key lifecycle is never
- * disturbed.
+ * This is a pure side-effect hook: the real keystore2 performs every operation, and only once it
+ * succeeded is our own synthetic state brought in line. We never fabricate a maintenance reply, so
+ * real key lifecycle is never disturbed.
  *
  * Mounted via `register()` from [Keystore2Interceptor.onInterceptorReady]; the maintenance binder
  * is hosted by the same keystore2 process, so the already-injected native hook reaches it too.
@@ -29,6 +28,8 @@ object Keystore2MaintenanceInterceptor : BinderInterceptor() {
         InterceptorUtils.getTransactCode(stubClass, "deleteAllKeys")
     private val MIGRATE_KEY_NAMESPACE_TRANSACTION =
         InterceptorUtils.getTransactCode(stubClass, "migrateKeyNamespace")
+    private val ON_USER_REMOVED_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubClass, "onUserRemoved")
 
     /** Only the lifecycle transactions we mirror; unresolved codes (-1) are dropped. */
     val interceptedCodes: IntArray by lazy {
@@ -36,11 +37,14 @@ object Keystore2MaintenanceInterceptor : BinderInterceptor() {
                 CLEAR_NAMESPACE_TRANSACTION,
                 DELETE_ALL_KEYS_TRANSACTION,
                 MIGRATE_KEY_NAMESPACE_TRANSACTION,
+                ON_USER_REMOVED_TRANSACTION,
             )
             .filter { it != -1 }
             .toIntArray()
     }
 
+    // State is only touched in the post hook: keystore2 rejects these calls for unprivileged
+    // callers, and a rejected call must not cost anyone their software keys.
     override fun onPreTransact(
         txId: Long,
         target: IBinder,
@@ -49,15 +53,33 @@ object Keystore2MaintenanceInterceptor : BinderInterceptor() {
         callingUid: Int,
         callingPid: Int,
         data: Parcel,
+    ): TransactionResult = TransactionResult.Continue
+
+    override fun onPostTransact(
+        txId: Long,
+        target: IBinder,
+        code: Int,
+        flags: Int,
+        callingUid: Int,
+        callingPid: Int,
+        data: Parcel,
+        reply: Parcel?,
+        resultCode: Int,
     ): TransactionResult {
+        if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply))
+            return TransactionResult.SkipTransaction
         when (code) {
             CLEAR_NAMESPACE_TRANSACTION -> handleClearNamespace(data)
             DELETE_ALL_KEYS_TRANSACTION ->
                 KeyMintSecurityLevelInterceptor.clearAllGeneratedKeys("maintenance.deleteAllKeys")
             MIGRATE_KEY_NAMESPACE_TRANSACTION -> handleMigrateKeyNamespace(data, callingUid)
+            ON_USER_REMOVED_TRANSACTION -> {
+                data.enforceInterface(IKeystoreMaintenance.DESCRIPTOR)
+                KeyMintSecurityLevelInterceptor.clearUserKeys(data.readInt())
+            }
         }
-        // Always let the real keystore2 perform the real lifecycle operation.
-        return TransactionResult.ContinueAndSkipPost
+        // The real reply stands as is.
+        return TransactionResult.SkipTransaction
     }
 
     private fun handleClearNamespace(data: Parcel) {
@@ -90,7 +112,8 @@ object Keystore2MaintenanceInterceptor : BinderInterceptor() {
     /** Resolves a synthetic owner key from a source descriptor (Domain.APP alias or KEY_ID). */
     private fun resolveSyntheticKeyId(descriptor: KeyDescriptor, callingUid: Int): KeyIdentifier? =
         when {
-            descriptor.alias != null -> KeyIdentifier(callingUid, descriptor.alias)
+            descriptor.domain == Domain.APP && descriptor.alias != null ->
+                KeyIdentifier(callingUid, descriptor.alias)
             descriptor.domain == Domain.KEY_ID ->
                 KeyMintSecurityLevelInterceptor.generatedKeys.entries
                     .firstOrNull {

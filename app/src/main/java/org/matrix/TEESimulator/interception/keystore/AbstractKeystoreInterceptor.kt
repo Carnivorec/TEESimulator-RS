@@ -70,8 +70,18 @@ abstract class AbstractKeystoreInterceptor : BinderInterceptor() {
 
     protected open val interceptedCodes: IntArray = intArrayOf()
 
+    /**
+     * Runs once the service is reachable but before any of its traffic is intercepted. Work that
+     * intercepted calls depend on (boot identity, restored keys) belongs here: an app request
+     * arriving before it finished would reach the real keystore and could replace a key the
+     * module still holds on disk.
+     */
+    var beforeRegister: (() -> Unit)? = null
+
     private fun setupInterceptor(service: IBinder, backdoor: IBinder) {
         keystoreService = service
+        beforeRegister?.invoke()
+        onBeforeRegister(service)
         SystemLogger.info("Registering interceptor for service: $serviceName")
         register(backdoor, service, this, interceptedCodes)
         service.linkToDeath(createDeathRecipient(), 0)
@@ -128,6 +138,9 @@ abstract class AbstractKeystoreInterceptor : BinderInterceptor() {
             )
             exitProcess(0)
         }
+
+    /** Subclass counterpart of [beforeRegister], run right after it. */
+    protected open fun onBeforeRegister(service: IBinder) {}
 
     /**
      * A hook for subclasses to perform additional setup after the interceptor is registered. For

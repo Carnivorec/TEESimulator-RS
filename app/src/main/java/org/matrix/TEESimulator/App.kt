@@ -49,12 +49,9 @@ object App {
             // Load the package configuration.
             ConfigurationManager.initialize()
 
-            // Initialize and start the appropriate keystore interceptors.
-            initializeInterceptors()
-
-            // Set up the device's boot key and hash, which are crucial for attestation.
-            AndroidDeviceUtils.setupBootKeyAndHash()
-
+            // Everything a software key generation needs is ready before the first request can
+            // be intercepted; a generation failing for want of a provider used to cost the alias
+            // its key.
             // Android ships with a stripped-down Bouncy Castle provider under the name "BC".
             // We must remove the system provider first to ensure the full Bouncy Castle library
             // (packaged with the app) is used.
@@ -62,6 +59,11 @@ object App {
             Security.addProvider(BouncyCastleProvider())
 
             NativeCertGen.initialize("/data/adb/modules/tricky_store/libcertgen.so")
+
+            // Initialize and start the appropriate keystore interceptors. The boot key and hash,
+            // which are crucial for attestation, are set up once keystore is reachable and
+            // before any of its traffic is intercepted.
+            initializeInterceptors()
 
             // Mount the SOTER forge on the on-demand soterserver process. The supervisor
             // binds and (re)injects on its own thread, returning at once so it never blocks the loop.
@@ -114,6 +116,7 @@ object App {
      */
     private fun initializeInterceptors() {
         val interceptor = selectKeystoreInterceptor()
+        interceptor.beforeRegister = { AndroidDeviceUtils.setupBootKeyAndHash() }
 
         // Continuously try to run the interceptor until it's successfully initialized.
         while (!interceptor.tryRunKeystoreInterceptor()) {

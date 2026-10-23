@@ -2,6 +2,7 @@ package org.matrix.TEESimulator.interception.keystore.shim
 
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -11,6 +12,7 @@ import java.io.IOException
 import java.security.KeyPair
 import java.security.MessageDigest
 import java.security.cert.Certificate
+import java.security.cert.CertificateFactory
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import org.matrix.TEESimulator.config.ConfigurationManager.CONFIG_PATH
@@ -109,7 +111,7 @@ object GeneratedKeyPersistence {
         digests: List<Int>,
         isAttestationKey: Boolean,
         metadataBytes: ByteArray? = null,
-    ) {
+    ): Boolean {
         require(keyPair != null || secretKey != null) {
             "Either keyPair or secretKey must be provided"
         }
@@ -119,7 +121,7 @@ object GeneratedKeyPersistence {
         lock.lock()
         try {
             SystemLogger.debug("[Persistence] Lock acquired for $filename")
-            runCatching {
+            return runCatching {
                     PERSISTENCE_DIR.mkdirs()
                     val finalFile = File(PERSISTENCE_DIR, filename)
                     val tmpFile = File(PERSISTENCE_DIR, "$filename.tmp")
@@ -200,6 +202,7 @@ object GeneratedKeyPersistence {
                     SystemLogger.debug("Persisted key: $keyId")
                 }
                 .onFailure { e -> SystemLogger.error("Failed to persist key $keyId", e) }
+                .isSuccess
         } finally {
             lock.unlock()
             SystemLogger.debug("[Persistence] Lock released for $filename")
@@ -221,6 +224,39 @@ object GeneratedKeyPersistence {
                 }
             }
             .onFailure { e -> SystemLogger.error("Failed to delete persisted key $keyId", e) }
+    }
+
+    private val BACKUP_DIR = File("/data/adb/tricky_store_backup")
+
+    private fun archiveDir(label: String): File =
+        File(BACKUP_DIR, "$label-${System.currentTimeMillis()}").apply { mkdirs() }
+
+    /** Moves the key file of [keyId] into a fresh backup directory instead of deleting it. */
+    fun archive(keyId: KeyIdentifier, label: String) {
+        runCatching {
+                val name = keyFileName(keyId.uid, keyId.alias)
+                val file = File(PERSISTENCE_DIR, name)
+                if (!file.exists()) return
+                if (!file.renameTo(File(archiveDir(label), name)))
+                    throw IOException("rename failed for ${file.name}")
+                fileLocks.remove(name)
+                SystemLogger.info("Archived persisted key $keyId to $BACKUP_DIR ($label)")
+            }
+            .onFailure { e -> SystemLogger.error("Failed to archive persisted key $keyId", e) }
+    }
+
+    /** Moves every key file into a fresh backup directory instead of deleting it. */
+    fun archiveAll(label: String) {
+        runCatching {
+                val files =
+                    PERSISTENCE_DIR.listFiles { _, name -> name.endsWith(".bin") } ?: return
+                if (files.isEmpty()) return
+                val dir = archiveDir(label)
+                val moved = files.count { it.renameTo(File(dir, it.name)) }
+                fileLocks.clear()
+                SystemLogger.info("Archived $moved of ${files.size} persisted key files to $dir")
+            }
+            .onFailure { e -> SystemLogger.error("Failed to archive persisted keys", e) }
     }
 
     fun deleteAll() {
@@ -388,10 +424,6 @@ object GeneratedKeyPersistence {
         }
 
         val newChain = CertificateHelper.getCertificateChain(metadata)
-        if (newChain == null) {
-            SystemLogger.warning("rePersist: could not extract cert chain for $keyId")
-            return
-        }
 
         val persisted =
             runCatching {
@@ -433,13 +465,28 @@ object GeneratedKeyPersistence {
                     }
                 }
                 .getOrNull()
+        // An update that clears the certificates still has to reach the disk, or the old chain
+        // comes back on the next boot. The stored chain then only keeps supplying the public key
+        // on load; the metadata snapshot carries what callers see.
+        val certChain =
+            newChain?.toList()
+                ?: runCatching {
+                        val factory = CertificateFactory.getInstance("X.509")
+                        persisted.certChainBytes.map {
+                            factory.generateCertificate(ByteArrayInputStream(it))
+                        }
+                    }
+                    .getOrElse {
+                        SystemLogger.warning("rePersist: unreadable stored chain for $keyId", it)
+                        return
+                    }
         save(
             keyId = keyId,
             keyPair = keyPair,
             secretKey = secretKey,
             nspace = generatedKeyInfo.nspace,
             securityLevel = secLevel,
-            certChain = newChain.toList(),
+            certChain = certChain,
             algorithm = persisted.algorithm,
             keySize = persisted.keySize,
             ecCurve = persisted.ecCurve,

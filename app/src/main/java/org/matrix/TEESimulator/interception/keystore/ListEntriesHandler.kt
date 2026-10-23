@@ -79,6 +79,11 @@ object ListEntriesHandler {
         return false
     }
 
+    /** Drops the parameters of a listing whose reply will not be merged (error or no reply). */
+    fun discard(txId: Long) {
+        pendingParams.remove(txId)
+    }
+
     // Merge software-backed keys with hardware-backed keys in the reply parcel.
     fun injectGeneratedKeys(txId: Long, callingUid: Int, reply: Parcel): Array<KeyDescriptor> {
         val params =

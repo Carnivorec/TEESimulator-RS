@@ -71,14 +71,30 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     // grant was a hidden API and SELinux denied untrusted_app, so a synthetic-key grant must answer
     // PERMISSION_DENIED pre-36 and a coherent virtualized grant on 36+.
     private const val GRANT_PUBLIC_API_SDK = 36
-    private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
 
-    fun forgetDeletedKey(keyId: KeyIdentifier) {
-        if (deletedSoftwareKeys.remove(keyId)) {
-            SystemLogger.debug("Cleared deletion marker for ${keyId.alias}")
-        }
+    // deleteKey transactions that removed a software key and were forwarded so keystore2 also
+    // drops any real key under the alias; their reply is success whatever keystore2 answers.
+    private val pendingSoftwareDeletes: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+
+    /** Forgets per-key state of [uid] (its data was cleared or it was uninstalled). */
+    fun forgetUid(uid: Int) {
+        userUpdatedKeys.removeIf { it.uid == uid }
     }
+
+    /**
+     * Whether listings of [uid] merge in its software keys. A skipped UID still reads its cached
+     * software keys through getKeyEntry, so its listing has to show them too.
+     */
+    private fun listsSoftwareKeys(uid: Int): Boolean =
+        !ConfigurationManager.shouldSkipUid(uid) ||
+            KeyMintSecurityLevelInterceptor.generatedKeys.keys.any { it.uid == uid }
+
+    /** The cache key an alias-addressed request names; only Domain.APP aliases are ours. */
+    private fun appKeyId(descriptor: KeyDescriptor, callingUid: Int): KeyIdentifier? =
+        if (descriptor.domain == Domain.APP && descriptor.alias != null)
+            KeyIdentifier(callingUid, descriptor.alias)
+        else null
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -103,9 +119,38 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
      * security level sub-services (e.g., TEE, StrongBox).
      */
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
-        val keystoreInterface = IKeystoreService.Stub.asInterface(service)
-        setupSecurityLevelInterceptors(keystoreInterface, backdoor)
+        registerSecurityLevelInterceptors(backdoor)
         setupMaintenanceInterceptor(backdoor)
+    }
+
+    private class PreparedSecurityLevel(
+        val binder: IBinder,
+        val interceptor: KeyMintSecurityLevelInterceptor,
+        val label: String,
+    )
+
+    private val preparedSecurityLevels = mutableListOf<PreparedSecurityLevel>()
+
+    /**
+     * Restores the persisted software keys before anything is intercepted. getKeyEntry on the main
+     * service consults them, so once it is hooked, an alias still on its way into memory would read
+     * as missing and the app would regenerate it over the stored key.
+     */
+    override fun onBeforeRegister(service: IBinder) {
+        val keystore = IKeystoreService.Stub.asInterface(service)
+        for ((level, label) in
+            listOf(SecurityLevel.TRUSTED_ENVIRONMENT to "TEE", SecurityLevel.STRONGBOX to "StrongBox")) {
+            runCatching {
+                    keystore.getSecurityLevel(level)?.let { sub ->
+                        val interceptor = KeyMintSecurityLevelInterceptor(sub, level)
+                        interceptor.loadPersistedKeys()
+                        preparedSecurityLevels.add(
+                            PreparedSecurityLevel(sub.asBinder(), interceptor, label)
+                        )
+                    }
+                }
+                .onFailure { SystemLogger.error("Failed to prepare $label SecurityLevel.", it) }
+        }
     }
 
     /**
@@ -131,40 +176,22 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             .onFailure { SystemLogger.error("Failed to intercept maintenance binder.", it) }
     }
 
-    private fun setupSecurityLevelInterceptors(service: IKeystoreService, backdoor: IBinder) {
-        // Attempt to get and intercept the TEE security level service.
-        runCatching {
-                service.getSecurityLevel(SecurityLevel.TRUSTED_ENVIRONMENT)?.let { tee ->
-                    SystemLogger.info("Found TEE SecurityLevel. Registering interceptor...")
-                    val interceptor =
-                        KeyMintSecurityLevelInterceptor(tee, SecurityLevel.TRUSTED_ENVIRONMENT)
+    private fun registerSecurityLevelInterceptors(backdoor: IBinder) {
+        for (level in preparedSecurityLevels) {
+            runCatching {
+                    SystemLogger.info("Found ${level.label} SecurityLevel. Registering interceptor...")
                     register(
                         backdoor,
-                        tee.asBinder(),
-                        interceptor,
+                        level.binder,
+                        level.interceptor,
                         KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
                     )
-                    interceptor.loadPersistedKeys()
                 }
-            }
-            .onFailure { SystemLogger.error("Failed to intercept TEE SecurityLevel.", it) }
-
-        // Attempt to get and intercept the StrongBox security level service.
-        runCatching {
-                service.getSecurityLevel(SecurityLevel.STRONGBOX)?.let { strongbox ->
-                    SystemLogger.info("Found StrongBox SecurityLevel. Registering interceptor...")
-                    val interceptor =
-                        KeyMintSecurityLevelInterceptor(strongbox, SecurityLevel.STRONGBOX)
-                    register(
-                        backdoor,
-                        strongbox.asBinder(),
-                        interceptor,
-                        KeyMintSecurityLevelInterceptor.INTERCEPTED_CODES,
-                    )
-                    interceptor.loadPersistedKeys()
+                .onFailure {
+                    SystemLogger.error("Failed to intercept ${level.label} SecurityLevel.", it)
                 }
-            }
-            .onFailure { SystemLogger.error("Failed to intercept StrongBox SecurityLevel.", it) }
+        }
+        preparedSecurityLevels.clear()
     }
 
     override fun onPreTransact(
@@ -178,16 +205,18 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     ): TransactionResult {
         if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
             logTransaction(txId, transactionNames[code]!!, callingUid, callingPid, true)
-            return if (ConfigurationManager.shouldSkipUid(callingUid))
-                TransactionResult.ContinueAndSkipPost
-            else TransactionResult.Continue
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            // Software keys all live in Domain.APP; other domains count real keys only.
+            if (data.readInt() != Domain.APP || !listsSoftwareKeys(callingUid))
+                return TransactionResult.ContinueAndSkipPost
+            return TransactionResult.Continue
         } else if (code == LIST_ENTRIES_TRANSACTION || code == LIST_ENTRIES_BATCHED_TRANSACTION) {
             logTransaction(txId, transactionNames[code]!!, callingUid, callingPid, true)
 
             val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
             val isGMS = packages.contains("com.google.android.gms")
 
-            if (isGMS || ConfigurationManager.shouldSkipUid(callingUid)) {
+            if (isGMS || !listsSoftwareKeys(callingUid)) {
                 return TransactionResult.ContinueAndSkipPost
             }
 
@@ -256,39 +285,38 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 return InterceptorUtils.createTypedObjectReply(response)
             }
 
-            // generateKey force-forges attest/device-id keys even for skipped UIDs; getKeyEntry
-            // must serve them back or the framework's attestKeyAlias lookup gets KEY_NOT_FOUND.
-            if (code != GET_KEY_ENTRY_TRANSACTION && ConfigurationManager.shouldSkipUid(callingUid))
-                return TransactionResult.ContinueAndSkipPost
-
+            // deleteKey is handled for skipped UIDs too: an app taken out of the target list still
+            // has its cached keys, and deleting one must not leave it to shadow the new key.
+            // generateKey force-forges attest/device-id keys even for skipped UIDs, so getKeyEntry
+            // serves cached keys to them as well, or the framework's attestKeyAlias lookup gets
+            // KEY_NOT_FOUND.
             if (code == DELETE_KEY_TRANSACTION) {
                 val keyId =
-                    if (descriptor.alias != null) {
-                        KeyIdentifier(callingUid, descriptor.alias)
-                    } else if (descriptor.domain == Domain.KEY_ID) {
-                        KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
-                                callingUid,
-                                descriptor.nspace,
-                            )
-                            ?.let { info ->
-                                KeyMintSecurityLevelInterceptor.generatedKeys.entries
-                                    .find {
-                                        it.value.nspace == info.nspace && it.key.uid == callingUid
-                                    }
-                                    ?.key
-                            }
-                    } else null
+                    appKeyId(descriptor, callingUid)
+                        ?: if (descriptor.domain == Domain.KEY_ID) {
+                            KeyMintSecurityLevelInterceptor.findGeneratedAliasByKeyId(
+                                    callingUid,
+                                    descriptor.nspace,
+                                )
+                                ?.let { KeyIdentifier(callingUid, it) }
+                                ?: KeyMintSecurityLevelInterceptor.findTeeKeyIdByKeyId(
+                                    callingUid,
+                                    descriptor.nspace,
+                                )
+                        } else null
 
                 if (keyId != null) {
                     val isSoftwareKey =
                         KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
                     KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
                     if (isSoftwareKey) {
-                        deletedSoftwareKeys.add(keyId)
+                        // Forward the delete as well: a real key the app made under this alias
+                        // before the software one would otherwise surface again on the next read.
+                        pendingSoftwareDeletes.add(txId)
                         SystemLogger.info(
-                            "[TX_ID: $txId] Deleted cached keypair ${keyId.alias}, replying with empty response."
+                            "[TX_ID: $txId] Deleted cached keypair ${keyId.alias}, forwarding to drop any real key."
                         )
-                        return InterceptorUtils.createSuccessReply(writeResultCode = false)
+                        return TransactionResult.Continue
                     }
                 }
                 return TransactionResult.ContinueAndSkipPost
@@ -337,16 +365,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 // keystore2.
                 return TransactionResult.ContinueAndSkipPost
             }
-            val keyId = KeyIdentifier(callingUid, descriptor.alias)
+            // Other domains (SELINUX, BLOB) never address our per-app cache.
+            val keyId =
+                appKeyId(descriptor, callingUid) ?: return TransactionResult.ContinueAndSkipPost
 
             val response = KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
             if (response == null) {
-                if (deletedSoftwareKeys.remove(keyId)) {
-                    SystemLogger.info(
-                        "[TX_ID: $txId] Returning KEY_NOT_FOUND for deleted key ${descriptor.alias}"
-                    )
-                    return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
-                }
                 // Owned keys were served above; for a skipped UID a non-owned key must still skip
                 // post-processing so we never patch an un-targeted app's real key.
                 return if (ConfigurationManager.shouldSkipUid(callingUid))
@@ -441,8 +465,18 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         reply: Parcel?,
         resultCode: Int,
     ): TransactionResult {
-        if (target != keystoreService || reply == null) return TransactionResult.SkipTransaction
+        if (target != keystoreService || reply == null) {
+            pendingSoftwareDeletes.remove(txId)
+            ListEntriesHandler.discard(txId)
+            return TransactionResult.SkipTransaction
+        }
+        // The software key is already gone; keystore2 usually has no real key under the alias and
+        // answers KEY_NOT_FOUND, which the caller must not see.
+        if (code == DELETE_KEY_TRANSACTION && pendingSoftwareDeletes.remove(txId)) {
+            return InterceptorUtils.createSuccessReply(writeResultCode = false)
+        }
         if (InterceptorUtils.hasException(reply)) {
+            ListEntriesHandler.discard(txId)
             val normalized = InterceptorUtils.normalizeServiceSpecificReply(reply)
             return if (normalized != null) TransactionResult.OverrideReply(normalized)
             else TransactionResult.SkipTransaction
@@ -586,7 +620,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
                         val newNspace = SecureRandom().nextLong()
                         response.metadata.key?.let { it.nspace = newNspace }
-                        KeyMintSecurityLevelInterceptor.generatedKeys[keyId] =
+                        val info =
                             KeyMintSecurityLevelInterceptor.GeneratedKeyInfo(
                                 keyData.first,
                                 null,
@@ -594,7 +628,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                 response,
                                 parsedParameters,
                             )
-                        KeyMintSecurityLevelInterceptor.attestationKeys.add(keyId)
 
                         // Snapshot metadata bytes for the same reason as the
                         // primary doSoftwareKeyGen path — loss-less restore
@@ -612,23 +645,29 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                     }
                                     .getOrNull()
                             }
-                        KeyMintSecurityLevelInterceptor.persist {
-                            GeneratedKeyPersistence.save(
-                                keyId = keyId,
-                                keyPair = keyData.first,
-                                secretKey = null,
-                                nspace = newNspace,
-                                securityLevel = response.metadata.keySecurityLevel,
-                                certChain = keyData.second,
-                                algorithm = parsedParameters.algorithm,
-                                keySize = parsedParameters.keySize,
-                                ecCurve = parsedParameters.ecCurve ?: 0,
-                                purposes = parsedParameters.purpose,
-                                digests = parsedParameters.digest,
+                        val stored =
+                            KeyMintSecurityLevelInterceptor.commitGeneratedKey(
+                                keyId,
+                                info,
                                 isAttestationKey = true,
-                                metadataBytes = metadataBytesForPersist,
-                            )
-                        }
+                            ) {
+                                GeneratedKeyPersistence.save(
+                                    keyId = keyId,
+                                    keyPair = keyData.first,
+                                    secretKey = null,
+                                    nspace = newNspace,
+                                    securityLevel = response.metadata.keySecurityLevel,
+                                    certChain = keyData.second,
+                                    algorithm = parsedParameters.algorithm,
+                                    keySize = parsedParameters.keySize,
+                                    ecCurve = parsedParameters.ecCurve ?: 0,
+                                    purposes = parsedParameters.purpose,
+                                    digests = parsedParameters.digest,
+                                    isAttestationKey = true,
+                                    metadataBytes = metadataBytesForPersist,
+                                )
+                            }
+                        if (!stored) throw Exception("Failed to store overriding attest key $keyId.")
 
                         return InterceptorUtils.createTypedObjectReply(response)
                     }
@@ -691,7 +730,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
      */
     private fun resolveOwnerKeyId(descriptor: KeyDescriptor, callingUid: Int): KeyIdentifier? =
         when {
-            descriptor.alias != null -> KeyIdentifier(callingUid, descriptor.alias)
+            descriptor.domain == Domain.APP -> appKeyId(descriptor, callingUid)
             descriptor.domain == Domain.KEY_ID ->
                 KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
                         callingUid,

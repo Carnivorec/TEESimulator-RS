@@ -21,6 +21,7 @@ import java.security.cert.Certificate
 import java.security.cert.CertificateFactory
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Date
+import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
@@ -89,10 +90,26 @@ class KeyMintSecurityLevelInterceptor(
                 val keyDescriptor =
                     data.readTypedObject(KeyDescriptor.CREATOR)
                         ?: return TransactionResult.ContinueAndSkipPost
+                if (keyDescriptor.domain != Domain.APP || keyDescriptor.alias == null)
+                    return TransactionResult.ContinueAndSkipPost
                 SystemLogger.info(
                     "[TX_ID: $txId] Forward to post-importKey hook for ${keyDescriptor.alias}[${keyDescriptor.nspace}]"
                 )
                 return TransactionResult.Continue
+            }
+            IMPORT_WRAPPED_KEY_TRANSACTION -> {
+                logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
+
+                data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                val keyDescriptor =
+                    data.readTypedObject(KeyDescriptor.CREATOR)
+                        ?: return TransactionResult.ContinueAndSkipPost
+                if (keyDescriptor.domain != Domain.APP || keyDescriptor.alias == null)
+                    return TransactionResult.ContinueAndSkipPost
+                // Only the post hook's cleanup is needed, and only if something is cached.
+                return if (hasCachedKey(KeyIdentifier(callingUid, keyDescriptor.alias)))
+                    TransactionResult.Continue
+                else TransactionResult.ContinueAndSkipPost
             }
         }
 
@@ -120,6 +137,16 @@ class KeyMintSecurityLevelInterceptor(
     ): TransactionResult {
         if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply))
             return TransactionResult.SkipTransaction
+
+        if (code == IMPORT_WRAPPED_KEY_TRANSACTION) {
+            data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+            val keyDescriptor =
+                data.readTypedObject(KeyDescriptor.CREATOR)
+                    ?: return TransactionResult.SkipTransaction
+            // The imported key replaced the alias in keystore2; what we cached for it is stale.
+            cleanupKeyData(KeyIdentifier(callingUid, keyDescriptor.alias))
+            return TransactionResult.SkipTransaction
+        }
 
         if (code == IMPORT_KEY_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
@@ -235,6 +262,9 @@ class KeyMintSecurityLevelInterceptor(
             // The HAL generated the new key: only now drop what a prior generation cached for
             // this alias (handleGenerateKey defers it), before any early return below.
             cleanupKeyData(keyId)
+            // An un-targeted app only came here to have its stale cache dropped: its real key is
+            // served untouched.
+            if (ConfigurationManager.shouldSkipUid(callingUid)) return TransactionResult.SkipTransaction
 
             val originalChain = CertificateHelper.getCertificateChain(metadata)
             if (originalChain == null || originalChain.size <= 1) {
@@ -313,7 +343,8 @@ class KeyMintSecurityLevelInterceptor(
                 SystemLogger.info(
                     "[LRU] Pruning operation for uid=$uid (active=${ops.size}/$maxOps)"
                 )
-                oldest.abort()
+                // It may have ended in the meantime, which abort reports as an invalid handle.
+                runCatching { oldest.abort() }
             }
         }
         ops.addLast(newOp)
@@ -378,6 +409,25 @@ class KeyMintSecurityLevelInterceptor(
                                     )
                                     return TransactionResult.ContinueAndSkipPost
                                 }
+                        }
+                        Domain.GRANT -> {
+                            // A grant we issued (Android 16 grantKeyAccess) names a software key
+                            // keystore2 has never seen; the grantee uses it here, as the owner.
+                            val grant =
+                                resolveGrant(keyDescriptor.nspace, callingUid)
+                                    ?: return if (softwareGrants.containsKey(keyDescriptor.nspace))
+                                        InterceptorUtils.createServiceSpecificErrorReply(
+                                            RESPONSE_KEY_NOT_FOUND
+                                        )
+                                    else TransactionResult.ContinueAndSkipPost
+                            if ((grant.accessVector and KEY_PERMISSION_USE) == 0) {
+                                return InterceptorUtils.createServiceSpecificErrorReply(
+                                    RESPONSE_PERMISSION_DENIED
+                                )
+                            }
+                            generatedKeys[grant.ownerKeyId]?.let {
+                                java.util.AbstractMap.SimpleEntry(grant.ownerKeyId, it)
+                            } ?: return TransactionResult.ContinueAndSkipPost
                         }
                         else -> {
                             SystemLogger.info(
@@ -469,20 +519,30 @@ class KeyMintSecurityLevelInterceptor(
                 if (keyParams?.usageCountLimit != null) {
                     val limit = keyParams.usageCountLimit
                     val remaining =
-                        usageCounters.getOrPut(resolvedKeyId) {
+                        usageCounters.computeIfAbsent(resolvedKeyId) {
                             java.util.concurrent.atomic.AtomicInteger(limit)
                         }
-                    if (remaining.get() <= 0) {
-                        cleanupKeyData(resolvedKeyId)
-                        usageCounters.remove(resolvedKeyId)
+                    // Only drop the key this operation was created for: the alias may have been
+                    // regenerated since, and the new key has a budget of its own.
+                    fun dropIfStillCurrent() {
+                        if (generatedKeys[resolvedKeyId] === generatedKeyInfo)
+                            cleanupKeyData(resolvedKeyId)
+                    }
+                    // A use is reserved up front, so concurrent operations cannot overrun the
+                    // limit; an operation that does not finish gives its use back.
+                    val reserved =
+                        remaining.getAndUpdate { if (it > 0) it - 1 else it } > 0
+                    if (!reserved) {
+                        dropIfStillCurrent()
                         return InterceptorUtils.createServiceSpecificErrorReply(
                             RESPONSE_KEY_NOT_FOUND
                         )
                     }
-                    softwareOperation.onFinishCallback = {
-                        if (remaining.decrementAndGet() <= 0) {
-                            cleanupKeyData(resolvedKeyId)
-                            usageCounters.remove(resolvedKeyId)
+                    softwareOperation.onEnd = { success ->
+                        if (!success) {
+                            remaining.incrementAndGet()
+                        } else if (remaining.get() <= 0) {
+                            dropIfStillCurrent()
                             SystemLogger.info(
                                 "Key $resolvedKeyId exhausted (USAGE_COUNT_LIMIT=$limit)."
                             )
@@ -527,6 +587,10 @@ class KeyMintSecurityLevelInterceptor(
         return runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
+                // Software keys are cached per app alias; a key in another domain (SELINUX
+                // namespaces, BLOB) is not the caller's to shadow.
+                if (keyDescriptor.domain != Domain.APP || keyDescriptor.alias == null)
+                    return TransactionResult.ContinueAndSkipPost
                 val attestationKey = data.readTypedObject(KeyDescriptor.CREATOR)
 
                 SystemLogger.debug(
@@ -615,7 +679,12 @@ class KeyMintSecurityLevelInterceptor(
                         !hasDeviceIdAttestation
                 ) {
                     logProbe("SKIP")
-                    return TransactionResult.ContinueAndSkipPost
+                    // An app taken out of the target list may still have this alias cached from
+                    // when it was targeted. Let the post hook drop that once the HAL has made the
+                    // new key, or every later read and operation would keep using the old one.
+                    return if (hasCachedKey(KeyIdentifier(callingUid, keyDescriptor.alias)))
+                        TransactionResult.Continue
+                    else TransactionResult.ContinueAndSkipPost
                 }
 
                 SystemLogger.trace {
@@ -711,8 +780,13 @@ class KeyMintSecurityLevelInterceptor(
                 // encrypted dies with the module's key store). Only a dead TEE still needs them
                 // forged.
                 val forgeSymmetric = !DeviceAttestationService.isTeeFunctional
+                // Neither forger handles Ed25519/X25519, so those keys always come from the HAL;
+                // a chain it attests is patched like any other.
+                val isCurve25519 =
+                    parsedParams.algorithm == Algorithm.EC &&
+                        parsedParams.ecCurve == EcCurve.CURVE_25519
                 val forceGenerate =
-                    oversized ||
+                    !isCurve25519 && (oversized ||
                         (ConfigurationManager.shouldGenerate(callingUid) &&
                             (!isSymmetric || forgeSymmetric)) ||
                         isAttestKeyRequest ||
@@ -725,7 +799,20 @@ class KeyMintSecurityLevelInterceptor(
                                     !DeviceAttestationService.isRsaAttestable(strongBox)
                                 Algorithm.EC -> !DeviceAttestationService.isEcAttestable(strongBox)
                                 else -> false
-                            })
+                            }))
+
+                // An even public exponent has no inverse, and RSA key generation would search for
+                // a key forever, holding a binder thread of every caller that tries.
+                val exponent = parsedParams.rsaPublicExponent
+                if (
+                    forceGenerate &&
+                        parsedParams.algorithm == Algorithm.RSA &&
+                        exponent != null &&
+                        (exponent <= java.math.BigInteger.ONE || !exponent.testBit(0))
+                ) {
+                    logProbe("REJECT:rsa_exponent")
+                    return InterceptorUtils.createServiceSpecificErrorReply(KEYMINT_INVALID_ARGUMENT)
+                }
 
                 SystemLogger.trace {
                     "[TRACE-$txId] dispatch: forceGen=$forceGenerate hasChallenge=${challenge != null} isSymmetric=$isSymmetric isAttestKey=$isAttestKeyRequest"
@@ -784,8 +871,8 @@ class KeyMintSecurityLevelInterceptor(
             "Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
         )
 
-        cleanupKeyData(keyId)
-
+        // The alias's previous key stays in place until commitGeneratedKey has stored the new one:
+        // any failure on the way (keybox, attest key, provider) leaves the caller's key intact.
         val isSymmetric =
             parsedParams.algorithm != Algorithm.EC && parsedParams.algorithm != Algorithm.RSA
 
@@ -801,6 +888,8 @@ class KeyMintSecurityLevelInterceptor(
                     Algorithm.AES -> "AES"
                     Algorithm.HMAC ->
                         when (parsedParams.digest.firstOrNull()) {
+                            Digest.SHA1 -> "HmacSHA1"
+                            Digest.SHA_2_224 -> "HmacSHA224"
                             Digest.SHA_2_384 -> "HmacSHA384"
                             Digest.SHA_2_512 -> "HmacSHA512"
                             else -> "HmacSHA256"
@@ -835,10 +924,6 @@ class KeyMintSecurityLevelInterceptor(
                     this.metadata = metadata
                     iSecurityLevel = original
                 }
-            generatedKeys[keyId] =
-                GeneratedKeyInfo(null, secretKey, keyDescriptor.nspace, response, parsedParams)
-            Keystore2Interceptor.forgetDeletedKey(keyId)
-
             // Persist symmetric keys too. Without this, AndroidX security
             // crypto MasterKey (AES-GCM-256) is regenerated on every reboot
             // and any EncryptedSharedPreferences becomes undecryptable —
@@ -857,23 +942,26 @@ class KeyMintSecurityLevelInterceptor(
                         }
                     }
                     .getOrNull()
-            persist {
-                GeneratedKeyPersistence.save(
-                    keyId = keyId,
-                    keyPair = null,
-                    secretKey = secretKey,
-                    nspace = keyDescriptor.nspace,
-                    securityLevel = securityLevel,
-                    certChain = emptyList(),
-                    algorithm = parsedParams.algorithm,
-                    keySize = parsedParams.keySize,
-                    ecCurve = parsedParams.ecCurve ?: 0,
-                    purposes = parsedParams.purpose,
-                    digests = parsedParams.digest,
-                    isAttestationKey = false,
-                    metadataBytes = metadataBytesForSymmetric,
-                )
-            }
+            val info = GeneratedKeyInfo(null, secretKey, keyDescriptor.nspace, response, parsedParams)
+            val stored =
+                commitGeneratedKey(keyId, info, isAttestationKey = false) {
+                    GeneratedKeyPersistence.save(
+                        keyId = keyId,
+                        keyPair = null,
+                        secretKey = secretKey,
+                        nspace = keyDescriptor.nspace,
+                        securityLevel = securityLevel,
+                        certChain = emptyList(),
+                        algorithm = parsedParams.algorithm,
+                        keySize = parsedParams.keySize,
+                        ecCurve = parsedParams.ecCurve ?: 0,
+                        purposes = parsedParams.purpose,
+                        digests = parsedParams.digest,
+                        isAttestationKey = false,
+                        metadataBytes = metadataBytesForSymmetric,
+                    )
+                }
+            if (!stored) throw keyNotStored(keyId)
 
             if (securityLevel == SecurityLevel.STRONGBOX) {
                 val delayMs =
@@ -946,10 +1034,6 @@ class KeyMintSecurityLevelInterceptor(
         val response =
             buildKeyEntryResponse(callingUid, keyData.second, parsedParams, keyDescriptor)
         AttestationDossier.logAuthShape(callingUid, txId, response.metadata?.authorizations)
-        generatedKeys[keyId] =
-            GeneratedKeyInfo(keyData.first, null, keyDescriptor.nspace, response, parsedParams)
-        Keystore2Interceptor.forgetDeletedKey(keyId)
-        if (isAttestKeyRequest) attestationKeys.add(keyId)
 
         if (SystemLogger.isDebugBuild) {
             val chain = keyData.second
@@ -982,23 +1066,26 @@ class KeyMintSecurityLevelInterceptor(
                     }
                     .getOrNull()
             }
-        persist {
-            GeneratedKeyPersistence.save(
-                keyId = keyId,
-                keyPair = keyData.first,
-                secretKey = null,
-                nspace = keyDescriptor.nspace,
-                securityLevel = securityLevel,
-                certChain = certChainCopy,
-                algorithm = parsedParams.algorithm,
-                keySize = parsedParams.keySize,
-                ecCurve = parsedParams.ecCurve ?: 0,
-                purposes = parsedParams.purpose,
-                digests = parsedParams.digest,
-                isAttestationKey = isAttestKeyRequest,
-                metadataBytes = metadataBytesForPersist,
-            )
-        }
+        val info = GeneratedKeyInfo(keyData.first, null, keyDescriptor.nspace, response, parsedParams)
+        val stored =
+            commitGeneratedKey(keyId, info, isAttestKeyRequest) {
+                GeneratedKeyPersistence.save(
+                    keyId = keyId,
+                    keyPair = keyData.first,
+                    secretKey = null,
+                    nspace = keyDescriptor.nspace,
+                    securityLevel = securityLevel,
+                    certChain = certChainCopy,
+                    algorithm = parsedParams.algorithm,
+                    keySize = parsedParams.keySize,
+                    ecCurve = parsedParams.ecCurve ?: 0,
+                    purposes = parsedParams.purpose,
+                    digests = parsedParams.digest,
+                    isAttestationKey = isAttestKeyRequest,
+                    metadataBytes = metadataBytesForPersist,
+                )
+            }
+        if (!stored) throw keyNotStored(keyId)
 
         if (securityLevel == SecurityLevel.STRONGBOX) {
             val delayMs =
@@ -1088,6 +1175,8 @@ class KeyMintSecurityLevelInterceptor(
                         callerNonce = params.callerNonce == true,
                         unlockedDeviceRequired = params.unlockedDeviceRequired == true,
                         noAuthRequired = params.noAuthRequired == true,
+                        userAuthType = params.userAuthType ?: -1,
+                        authTimeout = params.authTimeout ?: -1,
                         uid = callingUid,
                         debugLogging = SystemLogger.isDebugBuild,
                     )
@@ -1496,6 +1585,7 @@ class KeyMintSecurityLevelInterceptor(
         private const val RESPONSE_INVALID_ARGUMENT = 20
         private const val RESPONSE_PERMISSION_DENIED = 6
         private const val RESPONSE_KEY_NOT_FOUND = 7
+        private const val KEY_PERMISSION_USE = 0x100
         private const val TEE_LATENCY_FLOOR_MS = 15L
         private const val STRONGBOX_KEYGEN_LATENCY_FLOOR_MS = 250L
         private const val STRONGBOX_OP_LATENCY_FLOOR_MS = 80L
@@ -1505,6 +1595,12 @@ class KeyMintSecurityLevelInterceptor(
         private const val SECURE_HW_COMMUNICATION_FAILED = -49
         private const val MAX_CONCURRENT_OPS_PER_UID = 15
         private const val STRONGBOX_MAX_CONCURRENT_OPS = 4
+
+        private fun keyNotStored(keyId: KeyIdentifier) =
+            android.os.ServiceSpecificException(
+                SECURE_HW_COMMUNICATION_FAILED,
+                "Generated key $keyId could not be stored; the previous key is kept",
+            )
 
         private fun isStrongBoxCapable(params: KeyMintAttestation): Boolean =
             when (params.algorithm) {
@@ -1517,6 +1613,11 @@ class KeyMintSecurityLevelInterceptor(
             InterceptorUtils.getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
         private val IMPORT_KEY_TRANSACTION =
             InterceptorUtils.getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importKey")
+        private val IMPORT_WRAPPED_KEY_TRANSACTION =
+            InterceptorUtils.getTransactCode(
+                IKeystoreSecurityLevel.Stub::class.java,
+                "importWrappedKey",
+            )
         private val CREATE_OPERATION_TRANSACTION =
             InterceptorUtils.getTransactCode(
                 IKeystoreSecurityLevel.Stub::class.java,
@@ -1527,6 +1628,7 @@ class KeyMintSecurityLevelInterceptor(
             intArrayOf(
                 GENERATE_KEY_TRANSACTION,
                 IMPORT_KEY_TRANSACTION,
+                IMPORT_WRAPPED_KEY_TRANSACTION,
                 CREATE_OPERATION_TRANSACTION,
             )
 
@@ -1549,6 +1651,33 @@ class KeyMintSecurityLevelInterceptor(
          * be written back.
          */
         fun persist(task: () -> Unit) = persistExecutor.execute(task)
+
+        /**
+         * Makes a freshly generated software key the alias's key. The file is written first and
+         * the previous key is dropped only after that succeeded, so a failed generation or a full
+         * disk never costs the caller the key it already had, and a reply of success means the key
+         * survives a reboot. Running on the persist thread orders the swap with every other save
+         * and delete of the alias, so concurrent generations leave memory and disk agreeing.
+         *
+         * @return false when the key could not be stored; nothing was changed then.
+         */
+        fun commitGeneratedKey(
+            keyId: KeyIdentifier,
+            info: GeneratedKeyInfo,
+            isAttestationKey: Boolean,
+            save: () -> Boolean,
+        ): Boolean =
+            persistExecutor
+                .submit(
+                    Callable {
+                        if (!save()) return@Callable false
+                        cleanupKeyData(keyId, deleteFile = false)
+                        generatedKeys[keyId] = info
+                        if (isAttestationKey) attestationKeys.add(keyId)
+                        true
+                    }
+                )
+                .get()
 
         val generatedKeys = ConcurrentHashMap<KeyIdentifier, GeneratedKeyInfo>()
         val teeResponses = ConcurrentHashMap<KeyIdentifier, KeyEntryResponse>()
@@ -1676,11 +1805,15 @@ class KeyMintSecurityLevelInterceptor(
 
         fun isAttestationKey(keyId: KeyIdentifier): Boolean = attestationKeys.contains(keyId)
 
-        fun cleanupKeyData(keyId: KeyIdentifier) {
+        /**
+         * Drops everything cached for [keyId]. [deleteFile] is false only when the caller has just
+         * written the alias's replacement file, which a queued delete would destroy.
+         */
+        fun cleanupKeyData(keyId: KeyIdentifier, deleteFile: Boolean = true) {
             purgeGrantsForKey(keyId) // grants die with the key (Android 16 path; no-op pre-36)
             if (generatedKeys.remove(keyId) != null) {
                 SystemLogger.debug("Remove generated key ${keyId}")
-                persist { GeneratedKeyPersistence.delete(keyId) }
+                if (deleteFile) persist { GeneratedKeyPersistence.delete(keyId) }
             }
             teeResponses.remove(keyId)
             if (patchedChains.remove(keyId) != null) {
@@ -1693,35 +1826,127 @@ class KeyMintSecurityLevelInterceptor(
             usageCounters.remove(keyId)
         }
 
-        /** Clears every synthetic key owned by [uid] (maintenance.clearNamespace, Domain.APP). */
+        /** Whether anything is cached for [keyId]: a software key or a real key's metadata. */
+        fun hasCachedKey(keyId: KeyIdentifier): Boolean =
+            generatedKeys.containsKey(keyId) ||
+                teeResponses.containsKey(keyId) ||
+                patchedChains.containsKey(keyId) ||
+                importedKeys.contains(keyId)
+
+        private fun cachedKeyIds(): Set<KeyIdentifier> =
+            generatedKeys.keys + teeResponses.keys + patchedChains.keys + importedKeys +
+                attestationKeys + usageCounters.keys
+
+        /**
+         * Clears everything cached for [uid] (maintenance.clearNamespace, Domain.APP): software
+         * keys and the metadata cached for its real keys alike. Clearing an app's data or
+         * uninstalling it deletes those real keys, so a cached response would name a key id that
+         * keystore2 no longer has.
+         */
         fun clearNamespaceKeys(uid: Int) {
-            val victims = generatedKeys.keys.filter { it.uid == uid }
-            if (victims.isEmpty()) return
+            val victims = cachedKeyIds().filter { it.uid == uid }
             victims.forEach { cleanupKeyData(it) } // also purges grants + persistence
-            SystemLogger.info(
-                "Cleared ${victims.size} synthetic keys for uid=$uid (maintenance.clearNamespace)"
-            )
+            softwareGrants.entries
+                .filter { it.value.granteeUid == uid }
+                .forEach { softwareGrants.remove(it.key) }
+            Keystore2Interceptor.forgetUid(uid)
+            if (victims.isNotEmpty())
+                SystemLogger.info(
+                    "Cleared ${victims.size} cached keys for uid=$uid (maintenance.clearNamespace)"
+                )
+        }
+
+        /**
+         * Removes every key of Android user [userId] (maintenance.onUserRemoved). The files are
+         * moved to the backup directory rather than deleted, and the user id may be reused later:
+         * left in place, the keys would surface for whichever app is installed under the old uid.
+         */
+        fun clearUserKeys(userId: Int) {
+            val uids = cachedKeyIds().filter { it.uid / 100000 == userId }.map { it.uid }.toSet()
+            for (uid in uids) {
+                val software = generatedKeys.keys.filter { it.uid == uid }
+                software.forEach { keyId ->
+                    generatedKeys.remove(keyId)
+                    persist { GeneratedKeyPersistence.archive(keyId, "user$userId-removed") }
+                }
+                clearNamespaceKeys(uid)
+            }
+            if (uids.isNotEmpty())
+                SystemLogger.info("Cleared cached keys of ${uids.size} uids for removed user $userId")
+        }
+
+        /** The alias of a real key whose metadata is cached, addressed by KEY_ID. */
+        fun findTeeKeyIdByKeyId(callingUid: Int, nspace: Long?): KeyIdentifier? {
+            if (nspace == null || nspace == 0L) return null
+            return teeResponses.entries
+                .firstOrNull { (keyId, response) ->
+                    keyId.uid == callingUid && response.metadata?.key?.nspace == nspace
+                }
+                ?.key
         }
 
         /**
          * Re-keys a synthetic entry from [srcId] to [dstId] for maintenance.migrateKeyNamespace,
          * preserving the key material, certificate chain, and any grants (which reference the key,
-         * not the namespace). In-memory only: the stale persisted file is dropped and the migrated
-         * key is not re-persisted, matching the single-session boundary the grant plane already
-         * accepts (Phase 9 plan §9). No-op if [srcId] is not ours or [dstId] already exists.
+         * not the namespace). The key is stored under [dstId] before the [srcId] file goes, so it
+         * survives a reboot. No-op if [srcId] is not ours or [dstId] already exists.
          */
         fun migrateGeneratedKey(srcId: KeyIdentifier, dstId: KeyIdentifier) {
             if (srcId == dstId || generatedKeys.containsKey(dstId)) return
-            val info = generatedKeys.remove(srcId) ?: return
-            generatedKeys[dstId] = info
-            if (attestationKeys.remove(srcId)) attestationKeys.add(dstId)
-            if (importedKeys.remove(srcId)) importedKeys.add(dstId)
-            softwareGrants.entries
-                .filter { it.value.ownerKeyId == srcId }
-                .forEach { softwareGrants[it.key] = it.value.copy(ownerKeyId = dstId) }
-            persist { GeneratedKeyPersistence.delete(srcId) }
-            SystemLogger.info(
-                "Migrated synthetic key $srcId -> $dstId (maintenance.migrateKeyNamespace)"
+            val info = generatedKeys[srcId] ?: return
+            val isAttestKey = attestationKeys.contains(srcId)
+            persist {
+                if (!saveGeneratedKey(dstId, info, isAttestKey)) {
+                    SystemLogger.error("Could not store migrated key $dstId; keeping $srcId")
+                    return@persist
+                }
+                generatedKeys.remove(srcId)
+                generatedKeys[dstId] = info
+                if (attestationKeys.remove(srcId)) attestationKeys.add(dstId)
+                if (importedKeys.remove(srcId)) importedKeys.add(dstId)
+                softwareGrants.entries
+                    .filter { it.value.ownerKeyId == srcId }
+                    .forEach { softwareGrants[it.key] = it.value.copy(ownerKeyId = dstId) }
+                GeneratedKeyPersistence.delete(srcId)
+                SystemLogger.info(
+                    "Migrated synthetic key $srcId -> $dstId (maintenance.migrateKeyNamespace)"
+                )
+            }
+        }
+
+        /** Writes [info] to disk as [keyId], from the state the interceptor holds in memory. */
+        private fun saveGeneratedKey(
+            keyId: KeyIdentifier,
+            info: GeneratedKeyInfo,
+            isAttestKey: Boolean,
+        ): Boolean {
+            val metadata = info.response.metadata ?: return false
+            val params = info.keyParams
+            val metadataBytes =
+                runCatching {
+                        val parcel = Parcel.obtain()
+                        try {
+                            metadata.writeToParcel(parcel, 0)
+                            parcel.marshall()
+                        } finally {
+                            parcel.recycle()
+                        }
+                    }
+                    .getOrNull()
+            return GeneratedKeyPersistence.save(
+                keyId = keyId,
+                keyPair = info.keyPair,
+                secretKey = info.secretKey,
+                nspace = info.nspace,
+                securityLevel = metadata.keySecurityLevel,
+                certChain = CertificateHelper.getCertificateChain(metadata)?.toList() ?: emptyList(),
+                algorithm = params?.algorithm ?: 0,
+                keySize = params?.keySize ?: 0,
+                ecCurve = params?.ecCurve ?: 0,
+                purposes = params?.purpose ?: emptyList(),
+                digests = params?.digest ?: emptyList(),
+                isAttestationKey = isAttestKey,
+                metadataBytes = metadataBytes,
             )
         }
 
@@ -1751,7 +1976,8 @@ class KeyMintSecurityLevelInterceptor(
             importedKeys.clear()
             usageCounters.clear()
             softwareGrants.clear()
-            persist { GeneratedKeyPersistence.deleteAll() }
+            // Moved aside, not deleted: this is the one path that would wipe every app's keys.
+            persist { GeneratedKeyPersistence.archiveAll("delete-all-keys") }
             SystemLogger.info("Cleared all cached keys ($count entries)$reasonMessage.")
         }
     }
@@ -1795,6 +2021,11 @@ private fun KeyMintAttestation.toAuthorizations(
     this.digest.forEach { authList.add(createAuth(Tag.DIGEST, KeyParameterValue.digest(it))) }
     this.padding.forEach {
         authList.add(createAuth(Tag.PADDING, KeyParameterValue.paddingMode(it)))
+    }
+    // The framework only sends an OAEP MGF1 digest to begin() when the key lists it; without it
+    // every decryption falls back to SHA-1 whatever the app encrypted with.
+    this.rsaOaepMgfDigest.forEach {
+        authList.add(createAuth(Tag.RSA_OAEP_MGF_DIGEST, KeyParameterValue.digest(it)))
     }
     if (this.rsaPublicExponent != null) {
         authList.add(
