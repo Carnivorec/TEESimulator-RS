@@ -91,8 +91,8 @@ object DeviceAttestationService {
     private val teeProbeInFlight = AtomicBoolean(false)
 
     /**
-     * Whether the device's TEE can generate keys. AUTO mode forges every key of every targeted app
-     * while this is false, so only a definitive answer is cached: a working TEE, or a permanent
+     * Whether the device's TEE can generate keys. Every key of every targeted app is forged while
+     * this is false, symmetric ones included, so only a definitive answer is cached: a working TEE, or a permanent
      * keystore failure. An inconclusive probe (early in boot, attestation keys not provisioned
      * yet) reports a working TEE and is retried after [TEE_REPROBE_INTERVAL_MS]; it used to stick
      * as "no TEE" for the whole boot.
@@ -122,6 +122,42 @@ object DeviceAttestationService {
                 }
             }
             return teeVerdict ?: true
+        }
+
+    @Volatile private var teeAttests = false
+    @Volatile private var lastAttestedProbeMs = 0L
+
+    /**
+     * Whether the TEE can attest a key, which is what AUTO mode decides on. A TEE can work while
+     * attestation does not (attestation keys revoked, broken or not provisioned yet), and AUTO
+     * PATCHing every attested key of every targeted app then fails them all; while this is false
+     * AUTO forges as GENERATE does, symmetric keys still going to the working TEE. A failed attested
+     * probe is retried after [TEE_REPROBE_INTERVAL_MS] in case attestation becomes available.
+     */
+    val isTeeAttesting: Boolean
+        get() {
+            if (!isTeeFunctional) return false
+            if (teeAttests) return true
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (
+                now - lastAttestedProbeMs >= TEE_REPROBE_INTERVAL_MS &&
+                    teeProbeInFlight.compareAndSet(false, true)
+            ) {
+                try {
+                    if (!teeAttests) {
+                        lastAttestedProbeMs = now
+                        // The key is kept, as after the first check, for [CachedAttestationData].
+                        runCatching { generateTeeCheckKey(TEE_CHECK_KEY_ALIAS, attested = true) }
+                            .onSuccess {
+                                teeAttests = true
+                                recordTeeCheck("TEE attestation is available now.", null)
+                            }
+                    }
+                } finally {
+                    teeProbeInFlight.set(false)
+                }
+            }
+            return teeAttests
         }
 
     // Per (algorithm, security-level) attestation-capability verdicts, keyed by probe-key alias.
@@ -244,7 +280,9 @@ object DeviceAttestationService {
     private fun checkTeeFunctionality(): Boolean? {
         SystemLogger.info("Performing TEE functionality check...")
         try {
+            lastAttestedProbeMs = android.os.SystemClock.elapsedRealtime()
             generateTeeCheckKey(TEE_CHECK_KEY_ALIAS, attested = true)
+            teeAttests = true
             recordTeeCheck("TEE functionality check successful.", null)
             return true
         } catch (e: Exception) {
@@ -252,7 +290,7 @@ object DeviceAttestationService {
         }
         return try {
             generateTeeCheckKey(TEE_PLAIN_CHECK_KEY_ALIAS, attested = false)
-            recordTeeCheck("TEE works; attestation is not available for now.", null)
+            recordTeeCheck("TEE works; attestation is not available, AUTO forges for now.", null)
             true
         } catch (e: Exception) {
             // The same transient/permanent line the attestation probes draw.

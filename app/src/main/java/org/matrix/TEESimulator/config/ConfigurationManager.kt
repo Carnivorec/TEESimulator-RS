@@ -142,7 +142,7 @@ object ConfigurationManager {
                 Mode.GENERATE -> return Mode.GENERATE
                 Mode.PATCH -> return Mode.PATCH
                 Mode.AUTO ->
-                    return if (DeviceAttestationService.isTeeFunctional) Mode.PATCH
+                    return if (DeviceAttestationService.isTeeAttesting) Mode.PATCH
                     else Mode.GENERATE
                 null -> continue
             }
