@@ -100,8 +100,13 @@ data class KeyMintAttestation(
         certificateSerial = params.findBlob(Tag.CERTIFICATE_SERIAL)?.let { BigInteger(it) },
 
         // AOSP: [key_param(tag = CERTIFICATE_SUBJECT, field = Blob)]
+        // Parsed from the DER as is: going through X500Principal.name (RFC 2253, last RDN first)
+        // and back reversed the RDN order and re-encoded the string types.
         certificateSubject =
-            params.findBlob(Tag.CERTIFICATE_SUBJECT)?.let { X500Name(X500Principal(it).name) },
+            params.findBlob(Tag.CERTIFICATE_SUBJECT)?.let {
+                kotlin.runCatching { X500Name.getInstance(it) }
+                    .getOrElse { _ -> X500Name(X500Principal(it).name) }
+            },
 
         // AOSP: [key_param(tag = CERTIFICATE_NOT_BEFORE, field = DateTime)]
         certificateNotBefore = params.findDate(Tag.CERTIFICATE_NOT_BEFORE),

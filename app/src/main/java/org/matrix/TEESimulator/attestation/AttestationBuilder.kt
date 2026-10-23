@@ -289,6 +289,27 @@ object AttestationBuilder {
             list.add(
                 DERTaggedObject(true, AttestationConstants.TAG_NO_AUTH_REQUIRED, DERNull.INSTANCE)
             )
+        } else {
+            // An auth-bound key attests how it is bound, matching what its KeyMetadata reports.
+            // USER_SECURE_ID is never attested.
+            params.userAuthType?.let {
+                list.add(
+                    DERTaggedObject(
+                        true,
+                        AttestationConstants.TAG_USER_AUTH_TYPE,
+                        ASN1Integer(it.toLong()),
+                    )
+                )
+            }
+            params.authTimeout?.let {
+                list.add(
+                    DERTaggedObject(
+                        true,
+                        AttestationConstants.TAG_AUTH_TIMEOUT,
+                        ASN1Integer(it.toLong()),
+                    )
+                )
+            }
         }
 
         if (params.allowWhileOnBody == true) {
@@ -575,7 +596,13 @@ object AttestationBuilder {
 
             packageInfoList.add(packageInfo.packageName to packageInfo.longVersionCode)
 
-            packageInfo.signingInfo?.signingCertificateHistory?.forEach { signature ->
+            // As the platform's attestation id provider does: an APK with several signers has no
+            // certificate history, its digests come from the current signers.
+            val signingInfo = packageInfo.signingInfo
+            val signatures =
+                if (signingInfo?.hasMultipleSigners() == true) signingInfo.apkContentsSigners
+                else signingInfo?.signingCertificateHistory
+            signatures?.forEach { signature ->
                 signatureDigests.add(Digest(sha256.digest(signature.toByteArray())))
             }
         }

@@ -40,6 +40,13 @@ fn generate_rsa_key_pair(key_size: u32, rsa_public_exponent: u64) -> Result<Gene
         ));
     }
 
+    // An even exponent (or 1) has no inverse mod phi(n): new_with_exp would search forever.
+    if rsa_public_exponent != 0 && (rsa_public_exponent < 3 || rsa_public_exponent % 2 == 0) {
+        return Err(CertGenError::InvalidParameter(
+            format!("RSA public exponent must be an odd number >= 3; got {rsa_public_exponent}")
+        ));
+    }
+
     let exp = if rsa_public_exponent == 0 {
         rsa::BigUint::from(65537u64)
     } else {
@@ -56,4 +63,17 @@ fn generate_rsa_key_pair(key_size: u32, rsa_public_exponent: u64) -> Result<Gene
     Ok(GeneratedKeyPair {
         private_key_pkcs8: pkcs8_der.as_bytes().to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_exponents_without_inverse() {
+        // These used to hang in new_with_exp instead of failing.
+        for exp in [1u64, 2, 4, 65536] {
+            assert!(generate_key_pair(Algorithm::Rsa, 2048, None, exp).is_err(), "exp={exp}");
+        }
+    }
 }

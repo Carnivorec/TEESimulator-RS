@@ -93,6 +93,9 @@ pub struct CertGenParams {
     pub caller_nonce: bool,
     pub unlocked_device_required: bool,
     pub no_auth_required: bool,
+    /// USER_AUTH_TYPE / AUTH_TIMEOUT of an auth-bound key; negative when not set.
+    pub user_auth_type: i32,
+    pub auth_timeout: i32,
 
     /// Calling app UID, used only to key diagnostic log lines to the requesting app.
     pub uid: i32,

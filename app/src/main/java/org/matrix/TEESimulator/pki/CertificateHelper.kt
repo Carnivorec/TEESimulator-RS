@@ -6,6 +6,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.StringReader
 import java.security.KeyPair
+import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.Signature
 import java.security.cert.Certificate
@@ -106,6 +107,36 @@ object CertificateHelper {
     }
 
     /**
+     * Verifies that [privateKey] belongs to [publicKey] by signing a probe, before the key is
+     * cached. No secret or signature is written to disk.
+     */
+    private fun requireKeyMatches(privateKey: PrivateKey, publicKey: PublicKey, format: String) {
+        val signatureAlgorithm =
+            when (privateKey.algorithm.uppercase(java.util.Locale.ROOT)) {
+                "RSA" -> "SHA256withRSA"
+                "EC", "ECDSA" -> "SHA256withECDSA"
+                else ->
+                    throw IllegalArgumentException(
+                        "Unsupported $format algorithm: ${privateKey.algorithm}"
+                    )
+            }
+        val probe = "TEESimulator-RS PKCS8 keypair validation".toByteArray()
+        val signature =
+            Signature.getInstance(signatureAlgorithm).run {
+                initSign(privateKey)
+                update(probe)
+                sign()
+            }
+        val verified =
+            Signature.getInstance(signatureAlgorithm).run {
+                initVerify(publicKey)
+                update(probe)
+                verify(signature)
+            }
+        require(verified) { "$format private key does not match certificate public key" }
+    }
+
+    /**
      * Parses a PEM-encoded private key and converts it into a Java [KeyPair].
      *
      * @param pemContent The string containing the PEM-encoded key.
@@ -120,8 +151,14 @@ object CertificateHelper {
             PEMParser(StringReader(pemContent.trimLines())).use { parser ->
                 when (val pemObject = parser.readObject()) {
                     is PEMKeyPair -> {
-                        // Preserve traditional BEGIN EC/RSA PRIVATE KEY compatibility.
-                        OperationResult.Success(JcaPEMKeyConverter().getKeyPair(pemObject))
+                        // Preserve traditional BEGIN EC/RSA PRIVATE KEY compatibility. The key
+                        // must still belong to the leaf certificate, as for PKCS#8 below: a
+                        // mismatched keybox signs chains that never verify.
+                        val keyPair = JcaPEMKeyConverter().getKeyPair(pemObject)
+                        if (certificatePublicKey != null) {
+                            requireKeyMatches(keyPair.private, certificatePublicKey, "PEM")
+                        }
+                        OperationResult.Success(keyPair)
                     }
                     is PrivateKeyInfo -> {
                         // BEGIN PRIVATE KEY: unencrypted PKCS#8 has no public key field.
@@ -132,29 +169,7 @@ object CertificateHelper {
                             )
                         } else {
                             val privateKey = JcaPEMKeyConverter().getPrivateKey(pemObject)
-                            val signatureAlgorithm =
-                                when (privateKey.algorithm.uppercase(java.util.Locale.ROOT)) {
-                                    "RSA" -> "SHA256withRSA"
-                                    "EC", "ECDSA" -> "SHA256withECDSA"
-                                    else -> throw IllegalArgumentException(
-                                        "Unsupported PKCS#8 algorithm: ${privateKey.algorithm}"
-                                    )
-                                }
-                            // Verify that certificate and private key belong together before
-                            // the key is cached. No secret or signature is written to disk.
-                            val probe = "TEESimulator-RS PKCS8 keypair validation".toByteArray()
-                            val signer = Signature.getInstance(signatureAlgorithm).apply {
-                                initSign(privateKey)
-                                update(probe)
-                            }
-                            val signature = signer.sign()
-                            val verifier = Signature.getInstance(signatureAlgorithm).apply {
-                                initVerify(certificatePublicKey)
-                                update(probe)
-                            }
-                            require(verifier.verify(signature)) {
-                                "PKCS#8 private key does not match certificate public key"
-                            }
+                            requireKeyMatches(privateKey, certificatePublicKey, "PKCS#8")
                             OperationResult.Success(KeyPair(certificatePublicKey, privateKey))
                         }
                     }

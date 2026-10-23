@@ -91,12 +91,22 @@ object KeyBoxManager {
      * keybox.xml without FileObserver delivering a usable invalidation event.
      */
     private fun loadKeyMap(fileName: String): Map<String, KeyBox> {
-        val parsed = keyStoreCache.getOrPut(fileName) { parseKeyStoreFile(fileName) }
-        if (parsed.isEmpty()) {
-            keyStoreCache.remove(fileName, parsed)
+        keyStoreCache[fileName]?.let {
+            return it
+        }
+        val generation = synchronized(cacheLock) { cacheGenerations[fileName] ?: 0L }
+        val parsed = parseKeyStoreFile(fileName)
+        // A parse that started before the file was replaced must not land in the cache after the
+        // invalidation, or the old keybox would be served until the next change.
+        synchronized(cacheLock) {
+            if (parsed.isNotEmpty() && (cacheGenerations[fileName] ?: 0L) == generation)
+                keyStoreCache[fileName] = parsed
         }
         return parsed
     }
+
+    private val cacheLock = Any()
+    private val cacheGenerations = HashMap<String, Long>()
 
     /**
      * Removes the cached data for a specific key store file.
@@ -108,7 +118,12 @@ object KeyBoxManager {
      */
     fun invalidateCache(keyStoreFileName: String) {
         // ConcurrentHashMap.remove returns the value if it existed, or null if it didn't.
-        if (keyStoreCache.remove(keyStoreFileName) != null) {
+        val removed =
+            synchronized(cacheLock) {
+                cacheGenerations[keyStoreFileName] = (cacheGenerations[keyStoreFileName] ?: 0L) + 1
+                keyStoreCache.remove(keyStoreFileName)
+            }
+        if (removed != null) {
             SystemLogger.info("Invalidated cache for key store file: $keyStoreFileName")
         } else {
             SystemLogger.debug(

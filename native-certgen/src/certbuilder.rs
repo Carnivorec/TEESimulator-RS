@@ -13,6 +13,8 @@ const OID_SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
 
 // Extension OIDs
 const OID_KEY_USAGE: &[u64] = &[2, 5, 29, 15];
+const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
+const KEY_USAGE_KEY_CERT_SIGN: u8 = 0x04;
 
 // AOSP ta/src/keys.rs:451-478: no challenge = self-signed leaf, chain depth 1
 pub fn build_self_signed_cert(
@@ -209,7 +211,11 @@ fn sign_tbs_rsa(tbs_der: &[u8], signing_key_der: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| CertGenError::SigningFailed(format!("RSA key parse: {e}")))?;
 
     let mut signing_key = SigningKey::<Sha256>::new(private_key);
-    let signature = signing_key.sign(tbs_der);
+    // sign() panics on failure (e.g. a modulus too short for the digest), and the release
+    // profile aborts on panic, which would take the whole daemon down.
+    let signature = signing_key
+        .try_sign(tbs_der)
+        .map_err(|e| CertGenError::SigningFailed(format!("RSA sign: {e}")))?;
 
     Ok(signature.to_vec())
 }
@@ -322,6 +328,18 @@ fn build_extensions(attestation_ext_der: Option<&[u8]>, purposes: &[i32]) -> Res
     if ku_byte != 0 {
         let ku_ext = build_key_usage_extension(ku_byte);
         extensions.push(ku_ext);
+    }
+
+    // An attestation key signs certificates, so like AOSP KeyMint (ta/src/keys.rs) its
+    // certificate carries a critical BasicConstraints cA=TRUE right after KeyUsage; strict
+    // PKIX validation rejects the chain without it.
+    if ku_byte & KEY_USAGE_KEY_CERT_SIGN != 0 {
+        let basic_constraints = encode_der_sequence(&[&encode_der_boolean(true)]);
+        extensions.push(build_extension(
+            &encode_der_oid(OID_BASIC_CONSTRAINTS),
+            true,
+            &basic_constraints,
+        ));
     }
 
     if let Some(attest_der) = attestation_ext_der {

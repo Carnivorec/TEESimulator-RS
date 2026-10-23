@@ -12,6 +12,7 @@ import java.security.spec.ECGenParameterSpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.util.Date
 import org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.asn1.x509.BasicConstraints
 import org.bouncycastle.asn1.x509.Extension
 import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.cert.X509CertificateHolder
@@ -101,8 +102,6 @@ object CertificateGenerator {
                 return listOf(buildSelfSignedCertificate(subjectKeyPair, params))
             }
 
-            val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
-
             val wantsAttestKey =
                 attestKeyAlias != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
             val attestKeyInfo =
@@ -122,18 +121,32 @@ object CertificateGenerator {
                 return null
             }
 
-            val (signingKey, issuer) =
-                attestKeyInfo?.let { it.first to it.second }
-                    ?: (keybox.keyPair to getIssuerFromKeybox(keybox))
-
-            val leafCert =
-                buildCertificate(subjectKeyPair, signingKey, issuer, params, uid, securityLevel)
-
             if (attestKeyInfo != null) {
-                listOf(leafCert)
-            } else {
-                listOf(leafCert) + keybox.certificates
+                // Signed by the caller's attest key: the keybox plays no part, so a missing or
+                // broken keybox must not fail this.
+                return listOf(
+                    buildCertificate(
+                        subjectKeyPair,
+                        attestKeyInfo.first,
+                        attestKeyInfo.second,
+                        params,
+                        uid,
+                        securityLevel,
+                    )
+                )
             }
+
+            val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
+            val leafCert =
+                buildCertificate(
+                    subjectKeyPair,
+                    keybox.keyPair,
+                    getIssuerFromKeybox(keybox),
+                    params,
+                    uid,
+                    securityLevel,
+                )
+            listOf(leafCert) + keybox.certificates
         } catch (e: android.os.ServiceSpecificException) {
             throw e
         } catch (e: Exception) {
@@ -257,6 +270,20 @@ object CertificateGenerator {
         return bits
     }
 
+    /**
+     * KeyUsage from the key's purposes, and for an attestation key (keyCertSign) a critical
+     * BasicConstraints cA=TRUE right after it, as AOSP KeyMint emits (ta/src/keys.rs). The key signs
+     * certificates, and strict PKIX validation rejects a chain whose signer is not a CA.
+     */
+    private fun addKeyUsageExtensions(builder: JcaX509v3CertificateBuilder, params: KeyMintAttestation) {
+        val keyUsageBits = buildKeyUsageFromPurposes(params.purpose)
+        if (keyUsageBits == 0) return
+        builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
+        if ((keyUsageBits and KeyUsage.keyCertSign) != 0) {
+            builder.addExtension(Extension.basicConstraints, true, BasicConstraints(true))
+        }
+    }
+
     /** Constructs a new X.509 certificate with a simulated attestation extension. */
     private fun buildCertificate(
         subjectKeyPair: KeyPair,
@@ -281,10 +308,7 @@ object CertificateGenerator {
             )
 
         // Add KeyUsage extension only if purposes map to valid bits
-        val keyUsageBits = buildKeyUsageFromPurposes(params.purpose)
-        if (keyUsageBits != 0) {
-            builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
-        }
+        addKeyUsageExtensions(builder, params)
         if (params.attestationChallenge != null) {
             builder.addExtension(
                 AttestationBuilder.buildAttestationExtension(params, uid, securityLevel)
@@ -328,10 +352,7 @@ object CertificateGenerator {
                 keyPair.public,
             )
 
-        val keyUsageBits = buildKeyUsageFromPurposes(params.purpose)
-        if (keyUsageBits != 0) {
-            builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
-        }
+        addKeyUsageExtensions(builder, params)
 
         val signerAlgorithm =
             when (keyPair.private.algorithm) {

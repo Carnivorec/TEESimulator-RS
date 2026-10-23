@@ -110,6 +110,15 @@ fn build_tee_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
     // Tag 503: NO_AUTH_REQUIRED — NULL (conditional)
     if params.no_auth_required {
         fields.push((503, enc_null()));
+    } else {
+        // Tag 504: USER_AUTH_TYPE, Tag 505: AUTH_TIMEOUT — INTEGER, for an auth-bound key, so
+        // the attestation agrees with its KeyMetadata. USER_SECURE_ID is never attested.
+        if params.user_auth_type >= 0 {
+            fields.push((504, enc_integer(params.user_auth_type as i64)));
+        }
+        if params.auth_timeout >= 0 {
+            fields.push((505, enc_integer(params.auth_timeout as i64)));
+        }
     }
 
     // Tag 702: ORIGIN — INTEGER 0 (GENERATED)
@@ -578,6 +587,23 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_bound_key_attests_auth_type_and_timeout() {
+        let mut params = make_test_params();
+        params.no_auth_required = false;
+        params.user_auth_type = 2; // FINGERPRINT
+        params.auth_timeout = 0;
+        let tee = build_tee_enforced(&params).unwrap();
+        let tags = extract_tag_numbers(skip_tlv_header(&tee));
+        assert!(tags.contains(&504) && tags.contains(&505), "tags={tags:?}");
+
+        // Never alongside NO_AUTH_REQUIRED.
+        params.no_auth_required = true;
+        let tee = build_tee_enforced(&params).unwrap();
+        let tags = extract_tag_numbers(skip_tlv_header(&tee));
+        assert!(!tags.contains(&504) && !tags.contains(&505), "tags={tags:?}");
+    }
+
+    #[test]
     fn test_enforcement_tags_omitted_when_unset() {
         let params = make_test_params();
         let sw = build_software_enforced(&params).unwrap();
@@ -645,6 +671,10 @@ mod tests {
             caller_nonce: false,
             unlocked_device_required: false,
             no_auth_required: true,
+            user_auth_type: -1,
+            auth_timeout: -1,
+            uid: 10000,
+            debug_logging: false,
         }
     }
 
