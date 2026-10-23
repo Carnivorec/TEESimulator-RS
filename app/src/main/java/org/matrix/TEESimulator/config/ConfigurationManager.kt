@@ -41,8 +41,34 @@ object ConfigurationManager {
     @Volatile private var globalCustomPatchLevel: CustomPatchLevel? = null
     @Volatile private var packagePatchLevels = mapOf<String, CustomPatchLevel>()
 
-    // Cache for UID to package name resolution.
-    private val uidToPackagesCache = ConcurrentHashMap<Int, Array<String>>()
+    // Cache for UID to package name resolution. Entries expire, so a uid reused by a newly
+    // installed package does not keep the old package's configuration.
+    private class CachedPackages(val packages: Array<String>, val loadedAtMs: Long)
+
+    private val uidToPackagesCache = ConcurrentHashMap<Int, CachedPackages>()
+    private const val UID_CACHE_TTL_MS = 60_000L
+    private const val EMPTY_UID_CACHE_TTL_MS = 5_000L
+
+    // System uids are shared by many packages (uid 1000 alone covers system_server, Settings and
+    // dozens of vendor apps), so a target entry for any one of them would take over the keys of
+    // the whole system. They are never targeted.
+    private const val FIRST_APPLICATION_UID = 10000
+    private val warnedSystemUids: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+
+    private fun isSystemUid(uid: Int): Boolean {
+        if (uid % 100000 >= FIRST_APPLICATION_UID) return false
+        if (warnedSystemUids.add(uid)) {
+            val listed = getPackagesForUid(uid).filter { it in packageModes }
+            if (listed.isNotEmpty())
+                SystemLogger.warning(
+                    "Ignoring target entries $listed: uid $uid is a shared system uid."
+                )
+        }
+        return true
+    }
+
+    /** A config line without surrounding blanks or the UTF-8 byte order mark some editors add. */
+    private fun cleanLine(line: String): String = line.trim().removePrefix("﻿").trim()
 
     /**
      * Initializes the configuration manager by loading all settings from disk and starting the file
@@ -94,6 +120,7 @@ object ConfigurationManager {
     fun shouldSkipUid(uid: Int): Boolean = getPackageModeForUid(uid) == null
 
     fun isAutoMode(uid: Int): Boolean {
+        if (isSystemUid(uid)) return false
         for (pkg in getPackagesForUid(uid)) {
             when (packageModes[pkg]) {
                 Mode.GENERATE,
@@ -106,6 +133,7 @@ object ConfigurationManager {
     }
 
     private fun getPackageModeForUid(uid: Int): Mode? {
+        if (isSystemUid(uid)) return null
         val packages = getPackagesForUid(uid)
         if (packages.isEmpty()) return null
 
@@ -154,7 +182,7 @@ object ConfigurationManager {
 
         try {
             file.readLines().forEach { line ->
-                val trimmedLine = line.trim()
+                val trimmedLine = cleanLine(line)
                 if (trimmedLine.isEmpty() || trimmedLine.startsWith("#")) return@forEach
 
                 // Check if the line defines a new keybox scope.
@@ -213,7 +241,7 @@ object ConfigurationManager {
 
             // First pass: group lines by context (global or package-specific).
             file.readLines().forEach { line ->
-                val trimmedLine = line.trim()
+                val trimmedLine = cleanLine(line)
                 if (trimmedLine.isEmpty() || trimmedLine.startsWith("#")) return@forEach
 
                 contextRegex.find(trimmedLine)?.let { currentContext = it.groupValues[1] }
@@ -291,23 +319,31 @@ object ConfigurationManager {
      * A FileObserver that monitors the configuration directory for changes and triggers reloads of
      * the relevant settings.
      */
-    private object ConfigObserver : FileObserver(configRoot, CLOSE_WRITE or MOVED_TO or DELETE) {
+    private object ConfigObserver :
+        FileObserver(configRoot, CLOSE_WRITE or MOVED_TO or MOVED_FROM or DELETE) {
         override fun onEvent(event: Int, path: String?) {
             path ?: return
+            // Other files here (.health_state, key backups) change all the time and are not ours.
+            if (path != TARGET_PACKAGES_FILE && path != PATCH_LEVEL_FILE && !path.endsWith(".xml"))
+                return
             SystemLogger.info("Configuration file change detected: $path (event: $event)")
 
-            val file = if (event != DELETE) File(configRoot, path) else null
+            // A file moved away is gone just like a deleted one: its settings stop applying.
+            val removed = (event and (DELETE or MOVED_FROM)) != 0
             when (path) {
                 TARGET_PACKAGES_FILE ->
-                    file?.let { loadTargetPackages(it) }
-                        ?: SystemLogger.warning("$TARGET_PACKAGES_FILE was deleted.")
-                PATCH_LEVEL_FILE ->
-                    file?.let { loadPatchLevelConfig(it) }
-                        ?: SystemLogger.warning("$PATCH_LEVEL_FILE was deleted.")
+                    if (removed) {
+                        SystemLogger.warning("$TARGET_PACKAGES_FILE was removed; no app is targeted.")
+                        packageModes = emptyMap()
+                        packageKeyboxes = emptyMap()
+                    } else loadTargetPackages(File(configRoot, path))
+                // A missing file resets the patch levels.
+                PATCH_LEVEL_FILE -> loadPatchLevelConfig(File(configRoot, path))
                 // Any change to an XML file is assumed to be a keybox.
                 // The cache in KeyBoxManager will handle reloading it on its next use.
                 else ->
                     if (path.endsWith(".xml")) {
+                        val file = File(configRoot, path)
                         SystemLogger.info(
                             "Keybox file $path may have changed. It will be reloaded on next access."
                         )
@@ -336,6 +372,8 @@ object ConfigurationManager {
             override fun binderDied() {
                 (iPackageManager as? IBinder)?.unlinkToDeath(this, 0)
                 iPackageManager = null
+                // Packages may be reinstalled or uids reassigned while it restarts.
+                uidToPackagesCache.clear()
                 SystemLogger.warning("Package manager service died. Will try to reconnect.")
             }
         }
@@ -375,14 +413,28 @@ object ConfigurationManager {
     }
 
     fun getPackagesForUid(uid: Int): Array<String> {
-        return uidToPackagesCache.getOrPut(uid) {
-            try {
-                getPackageManager()?.getPackagesForUid(uid) ?: emptyArray()
-            } catch (e: Exception) {
-                SystemLogger.warning("Failed to get packages for UID $uid", e)
-                emptyArray()
+        val now = System.currentTimeMillis()
+        uidToPackagesCache[uid]
+            ?.takeIf {
+                now - it.loadedAtMs <
+                    if (it.packages.isEmpty()) EMPTY_UID_CACHE_TTL_MS else UID_CACHE_TTL_MS
             }
-        }
+            ?.let {
+                return it.packages
+            }
+        val pm = getPackageManager() ?: return emptyArray()
+        val packages =
+            try {
+                pm.getPackagesForUid(uid) ?: emptyArray()
+            } catch (e: Exception) {
+                // A failed lookup is not cached: that would silently drop a targeted app from
+                // interception until the next reboot.
+                SystemLogger.warning("Failed to get packages for UID $uid", e)
+                return emptyArray()
+            }
+        // An empty answer (isolated processes, a uid being installed) is kept only briefly.
+        uidToPackagesCache[uid] = CachedPackages(packages, now)
+        return packages
     }
 
     /** Waits for a system service to become available, with retries. */

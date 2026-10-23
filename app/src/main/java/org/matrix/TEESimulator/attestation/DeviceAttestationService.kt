@@ -65,11 +65,38 @@ object DeviceAttestationService {
     // A unique alias for the key used to perform the TEE functionality check.
     private const val TEE_CHECK_KEY_ALIAS = "TEESimulator_AttestationCheck"
 
+    // Alias of the key that probes the TEE without attestation, when the attested probe failed.
+    private const val TEE_PLAIN_CHECK_KEY_ALIAS = "TEESimulator_TeeCheck"
+    private const val TEE_REPROBE_INTERVAL_MS = 30_000L
+
+    @Volatile private var teeVerdict: Boolean? = null
+    @Volatile private var lastTeeProbeMs = 0L
+    private val teeProbeInFlight = AtomicBoolean(false)
+
     /**
-     * Lazily determines if the device's TEE is functional by attempting to generate an
-     * attestation-backed key pair. The result is cached.
+     * Whether the device's TEE can generate keys. AUTO mode forges every key of every targeted app
+     * while this is false, so only a definitive answer is cached: a working TEE, or a permanent
+     * keystore failure. An inconclusive probe (early in boot, attestation keys not provisioned
+     * yet) reports a working TEE and is retried after [TEE_REPROBE_INTERVAL_MS]; it used to stick
+     * as "no TEE" for the whole boot.
      */
-    val isTeeFunctional: Boolean by lazy { checkTeeFunctionality() }
+    val isTeeFunctional: Boolean
+        get() {
+            teeVerdict?.let { return it }
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (
+                (lastTeeProbeMs == 0L || now - lastTeeProbeMs >= TEE_REPROBE_INTERVAL_MS) &&
+                    teeProbeInFlight.compareAndSet(false, true)
+            ) {
+                try {
+                    lastTeeProbeMs = now
+                    teeVerdict = checkTeeFunctionality()
+                } finally {
+                    teeProbeInFlight.set(false)
+                }
+            }
+            return teeVerdict ?: true
+        }
 
     // Per (algorithm, security-level) attestation-capability verdicts, keyed by probe-key alias.
     // A device may attest one algorithm or security level yet lack a provisioned attestation key
@@ -123,43 +150,95 @@ object DeviceAttestationService {
         return attestableVerdicts[probe.keyAlias] ?: true
     }
 
-    /**
-     * Lazily fetches and parses attestation data from a genuinely generated certificate. The result
-     * is cached. Returns null if the TEE is not functional or parsing fails.
-     */
-    val CachedAttestationData: AttestationData? by lazy { fetchAttestationData() }
+    @Volatile private var cachedAttestationData: AttestationData? = null
+    @Volatile private var lastAttestationFetchMs = 0L
 
     /**
-     * Checks if the TEE is working correctly by generating a key in the Android Keystore with an
-     * attestation challenge.
+     * Attestation data parsed from a genuinely generated certificate, or null while none could be
+     * obtained (no working TEE, attestation not available yet, parsing failed). Only a result is
+     * cached; a failed fetch is retried after [TEE_REPROBE_INTERVAL_MS].
+     */
+    val CachedAttestationData: AttestationData?
+        get() {
+            cachedAttestationData?.let { return it }
+            val now = android.os.SystemClock.elapsedRealtime()
+            synchronized(this) {
+                cachedAttestationData?.let { return it }
+                if (lastAttestationFetchMs != 0L && now - lastAttestationFetchMs < TEE_REPROBE_INTERVAL_MS)
+                    return null
+                lastAttestationFetchMs = now
+                cachedAttestationData = fetchAttestationData()
+            }
+            return cachedAttestationData
+        }
+
+    private fun generateTeeCheckKey(alias: String, attested: Boolean) {
+        val keyPairGenerator =
+            KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+        val builder =
+            KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(KeyProperties.DIGEST_SHA256)
+        // A random challenge is required for attestation.
+        if (attested)
+            builder.setAttestationChallenge(ByteArray(16).apply { SecureRandom().nextBytes(this) })
+        keyPairGenerator.initialize(builder.build())
+        keyPairGenerator.generateKeyPair()
+    }
+
+    /**
+     * Checks whether the TEE works. An attested key is tried first, as its certificate also feeds
+     * [CachedAttestationData]. Attestation can fail on a working TEE (remotely provisioned keys
+     * not available yet early in boot), so a failure is retried with a plain key, which needs no
+     * attestation key at all.
      *
-     * @return `true` if a key with attestation was generated successfully, `false` otherwise.
+     * @return true if the TEE generated a key, false on a permanent keystore failure, null if the
+     *   result is inconclusive and the check should run again later.
      */
-    private fun checkTeeFunctionality(): Boolean {
+    private fun checkTeeFunctionality(): Boolean? {
         SystemLogger.info("Performing TEE functionality check...")
+        try {
+            generateTeeCheckKey(TEE_CHECK_KEY_ALIAS, attested = true)
+            recordTeeCheck("TEE functionality check successful.", null)
+            return true
+        } catch (e: Exception) {
+            recordTeeCheck("Attested TEE check failed; retrying without attestation.", e)
+        }
         return try {
-            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            val keyPairGenerator =
-                KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
-
-            // A random challenge is required for attestation.
-            val challenge = ByteArray(16).apply { SecureRandom().nextBytes(this) }
-
-            val spec =
-                KeyGenParameterSpec.Builder(TEE_CHECK_KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
-                    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-                    .setDigests(KeyProperties.DIGEST_SHA256)
-                    .setAttestationChallenge(challenge)
-                    .build()
-
-            keyPairGenerator.initialize(spec)
-            keyPairGenerator.generateKeyPair()
-
-            SystemLogger.info("TEE functionality check successful.")
+            generateTeeCheckKey(TEE_PLAIN_CHECK_KEY_ALIAS, attested = false)
+            recordTeeCheck("TEE works; attestation is not available for now.", null)
             true
         } catch (e: Exception) {
-            SystemLogger.warning("TEE functionality check failed.", e)
-            false
+            // The same transient/permanent line the attestation probes draw.
+            val permanent = isAttestationUnavailable(e)
+            recordTeeCheck(
+                if (permanent) "TEE functionality check failed permanently."
+                else "TEE functionality check inconclusive; will retry.",
+                e,
+            )
+            if (permanent) false else null
+        } finally {
+            deleteProbeKey(TEE_PLAIN_CHECK_KEY_ALIAS)
+        }
+    }
+
+    private val teeCheckLog = java.io.File("/data/adb/tricky_store/logs/tee_check.log")
+    private const val TEE_CHECK_LOG_MAX_BYTES = 64 * 1024L
+
+    /**
+     * Logs a TEE check result, and also appends it to a small file of its own: whether AUTO mode
+     * forges is decided here once per boot, and logcat has rotated that line away by the time
+     * anyone looks.
+     */
+    private fun recordTeeCheck(message: String, error: Throwable?) {
+        if (error == null) SystemLogger.info(message) else SystemLogger.warning(message, error)
+        runCatching {
+            if (teeCheckLog.length() > TEE_CHECK_LOG_MAX_BYTES)
+                teeCheckLog.renameTo(java.io.File(teeCheckLog.path + ".old"))
+            val time = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date())
+            val cause = error?.let { " (${it.javaClass.simpleName}: ${it.message})" } ?: ""
+            teeCheckLog.appendText("$time $message$cause\n")
         }
     }
 
@@ -252,6 +331,10 @@ object DeviceAttestationService {
 
         return try {
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            // The TEE check leaves its attested key behind; when that attempt failed or the key
+            // was already consumed, make a new one.
+            if (!keyStore.containsAlias(TEE_CHECK_KEY_ALIAS))
+                generateTeeCheckKey(TEE_CHECK_KEY_ALIAS, attested = true)
             val certChain = keyStore.getCertificateChain(TEE_CHECK_KEY_ALIAS)
             if (certChain.isNullOrEmpty()) {
                 SystemLogger.warning("Could not retrieve certificate chain for TEE check key.")
