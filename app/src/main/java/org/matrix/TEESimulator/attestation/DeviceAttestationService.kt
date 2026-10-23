@@ -92,8 +92,8 @@ object DeviceAttestationService {
 
     /**
      * Whether the device's TEE can generate keys. Every key of every targeted app is forged while
-     * this is false, symmetric ones included, so only a definitive answer is cached: a working TEE, or a permanent
-     * keystore failure. An inconclusive probe (early in boot, attestation keys not provisioned
+     * this is false, symmetric ones included, so only a definitive answer is cached: a working
+     * TEE, or a permanent keystore failure. An inconclusive probe (early in boot, attestation keys not provisioned
      * yet) reports a working TEE and is retried after [TEE_REPROBE_INTERVAL_MS]; it used to stick
      * as "no TEE" for the whole boot.
      */
@@ -114,7 +114,8 @@ object DeviceAttestationService {
                             (!standing && isGuessedNegativeExpired(teeVerdictAtMs, now))
                     ) {
                         lastTeeProbeMs = now
-                        teeVerdict = checkTeeFunctionality()
+                        // Its attested probe settles [isTeeAttesting] too, which waits for it.
+                        teeVerdict = synchronized(attestProbeLock) { checkTeeFunctionality() }
                         teeVerdictAtMs = now
                     }
                 } finally {
@@ -126,6 +127,7 @@ object DeviceAttestationService {
 
     @Volatile private var teeAttests = false
     @Volatile private var lastAttestedProbeMs = 0L
+    private val attestProbeLock = Any()
 
     /**
      * Whether the TEE can attest a key, which is what AUTO mode decides on. A TEE can work while
@@ -133,31 +135,30 @@ object DeviceAttestationService {
      * PATCHing every attested key of every targeted app then fails them all; while this is false
      * AUTO forges as GENERATE does, symmetric keys still going to the working TEE. A failed attested
      * probe is retried after [TEE_REPROBE_INTERVAL_MS] in case attestation becomes available.
+     *
+     * Callers wait for a probe in flight rather than read the default: a request answered "no"
+     * while a working TEE is still being probed would be forged, and its key stays forged.
      */
     val isTeeAttesting: Boolean
         get() {
-            if (!isTeeFunctional) return false
             if (teeAttests) return true
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (
-                now - lastAttestedProbeMs >= TEE_REPROBE_INTERVAL_MS &&
-                    teeProbeInFlight.compareAndSet(false, true)
-            ) {
-                try {
-                    if (!teeAttests) {
-                        lastAttestedProbeMs = now
-                        // The key is kept, as after the first check, for [CachedAttestationData].
-                        runCatching { generateTeeCheckKey(TEE_CHECK_KEY_ALIAS, attested = true) }
-                            .onSuccess {
-                                teeAttests = true
-                                recordTeeCheck("TEE attestation is available now.", null)
-                            }
-                    }
-                } finally {
-                    teeProbeInFlight.set(false)
+            synchronized(attestProbeLock) {
+                if (teeAttests || !isTeeFunctional) return teeAttests
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (
+                    lastAttestedProbeMs == 0L ||
+                        now - lastAttestedProbeMs >= TEE_REPROBE_INTERVAL_MS
+                ) {
+                    lastAttestedProbeMs = now
+                    // The key is kept, as after the first check, for [CachedAttestationData].
+                    runCatching { generateTeeCheckKey(TEE_CHECK_KEY_ALIAS, attested = true) }
+                        .onSuccess {
+                            teeAttests = true
+                            recordTeeCheck("TEE attestation is available now.", null)
+                        }
                 }
+                return teeAttests
             }
-            return teeAttests
         }
 
     // Per (algorithm, security-level) attestation-capability verdicts, keyed by probe-key alias.
